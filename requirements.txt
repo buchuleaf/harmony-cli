@@ -16,9 +16,15 @@ mdurl==0.1.2
     # via markdown-it-py
 pygments==2.19.2
     # via rich
+regex==2025.9.18
+    # via tiktoken
 requests==2.32.5
-    # via harmony-cli (pyproject.toml)
+    # via
+    #   harmony-cli (pyproject.toml)
+    #   tiktoken
 rich==14.1.0
+    # via harmony-cli (pyproject.toml)
+tiktoken==0.11.0
     # via harmony-cli (pyproject.toml)
 urllib3==2.5.0
     # via requests

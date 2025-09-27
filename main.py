@@ -2,19 +2,21 @@
 
 import json
 import requests
+import platform
 from tools import AVAILABLE_TOOLS
 from rich.console import Console
 from rich.panel import Panel
 
 # --- Constants and Global Setup ---
 API_URL = "http://localhost:8080/v1/chat/completions"
-MAX_TOOL_OUTPUT_LINES = 10
+MAX_TOOL_DISPLAY_LINES = 20
+MAX_TOOL_HISTORY_LINES = 10 
 console = Console()
 
 
-def truncate_for_display(output: str, max_lines: int) -> str:
+def truncate_output(output: str, max_lines: int) -> str:
     """
-    Truncates a string to a maximum number of lines for cleaner display.
+    Truncates a string to a maximum number of lines for cleaner display and history.
     """
     lines = output.splitlines()
     if len(lines) > max_lines:
@@ -57,7 +59,13 @@ def stream_model_response(messages, tools):
 
 
 def main():
-    conversation_history = []
+    # --- System Setup ---
+    os_name = platform.system()
+    system_prompt = {
+        "role": "system",
+        "content": f"You are running in a {os_name} environment. Please generate shell commands accordingly."
+    }
+    conversation_history = [system_prompt]
     
     tools_definition = [
         {"type": "function", "function": {"name": "read_file", "description": "Reads the content of a file. Can read the entire file or a specific range of lines.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string", "description": "The path to the file to read."}, "start_line": {"type": "integer", "description": "Optional. The 1-based line number to start reading from."}, "end_line": {"type": "integer", "description": "Optional. The 1-based line number to stop reading at (inclusive)."}}, "required": ["file_path"]}}},
@@ -66,6 +74,8 @@ def main():
     ]
 
     console.print(Panel("GPT-OSS API CLI (Stable UI)", style="bold green", expand=False))
+    console.print(f"[bold green]System:[/bold green] Running on {os_name}. The model has been informed.", style="italic")
+
 
     # --- Main Conversation Loop ---
     while True:
@@ -160,7 +170,10 @@ def main():
                         args = json.loads(args_str)
                         tool_function = AVAILABLE_TOOLS[function_name]
                         tool_output = tool_function(**args)
-                        display_output = truncate_for_display(tool_output, MAX_TOOL_OUTPUT_LINES)
+                        
+                        # Truncate for display and for history separately
+                        display_output = truncate_output(tool_output, MAX_TOOL_DISPLAY_LINES)
+                        history_output = truncate_output(tool_output, MAX_TOOL_HISTORY_LINES)
 
                         console.print(Panel(display_output, title=f"\n[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
 
@@ -168,7 +181,7 @@ def main():
                             "tool_call_id": tool_call["id"],
                             "role": "tool",
                             "name": function_name,
-                            "content": tool_output,
+                            "content": history_output,
                         })
                     except json.JSONDecodeError as e:
                         console.print(Panel(f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}", title="[bold red]Argument Error[/bold red]", border_style="red"))
