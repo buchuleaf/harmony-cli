@@ -1,11 +1,16 @@
-# cli.py
+# main.py
 
 import json
-import requests
+import uuid
 import platform
+import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
+
+# Local imports from your other files
+from harmony import create_system_message, create_developer_message
+from tools import ToolExecutor, MAX_TOOL_OUTPUT_CHARS, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH, _truncate_output
 
 # --- Constants and Global Setup ---
 API_URL = "http://localhost:8080/v1/chat/completions"
@@ -36,97 +41,53 @@ def stream_model_response(messages, tools):
                             chunk = json.loads(json_str)
                             yield chunk
                         except json.JSONDecodeError:
-                            console.print(f"\n[Error decoding JSON chunk: {json_str}]", style="bold red")
+                            # Use a direct print here as console might not be in scope
+                            print(f"\n[Error decoding JSON chunk: {json_str}]")
     except requests.exceptions.RequestException as e:
-        console.print(f"\n[Error connecting to the model API: {e}]", style="bold red")
+        print(f"\n[Error connecting to the model API: {e}]")
 
 
-def main():    
+def main():
+    # --- Create a Rich Console instance ---
+    console = Console()
+    
+    # --- Initialize conversation state ---
+    conversation_history = []
+    tool_executor = ToolExecutor() # Manages tools and their cache
+
+    # --- OS-Specific Tool Configuration ---
+    if platform.system() == "Windows":
+        shell_name = "Command Prompt"
+        shell_examples = "Example: `dir` to list files."
+    else:
+        shell_name = "bash"
+        shell_examples = "Example: `ls -l` to list files."
+
     # --- Tool Definitions for the Model ---
-    # This remains as JSON because it's passed directly to the OpenAI-compatible API.
-    # Our harmony.py library will convert this into the text format for the developer message.
     tools_definition = [
-        {
-            "type": "function", "function": {
-                "name": "python",
-                "description": "Executes Python code for file I/O, data manipulation, and logic. NOTE: If the output is very large, it will be cached and a cache_id will be returned.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "The Python code to execute."}
-                    },
-                    "required": ["code"]
-                }
-            }
-        },
-        {
-            "type": "function", "function": {
-                "name": "shell",
-                "description": f"Executes a {shell_name} command for tasks like running external programs. NOTE: If the output is very large, it will be cached and a cache_id will be returned. {shell_examples}",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "The shell command to execute."}
-                    },
-                    "required": ["command"]
-                }
-            }
-        },
-        {
-            "type": "function", "function": {
-                "name": "view_cached_output",
-                "description": "Retrieve a portion of large, cached output from a previous `python` or `shell` call. Choose exactly one mode: line mode OR char mode.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_id":   {"type": "string",  "description": "Unique ID of the cached output."},
-
-                        # Line-mode params
-                        "start_line":   {"type": "integer", "description": "Start line (0-indexed). Use with line_count only."},
-                        "line_count":   {"type": "integer", "description": "Number of lines to retrieve (>0)."},
-                        "before_lines": {"type": "integer", "description": "Optional extra context lines to include BEFORE the window (>=0)."},
-                        "after_lines":  {"type": "integer", "description": "Optional extra context lines to include AFTER the window (>=0)."},
-
-                        # Char-mode params
-                        "start_char": {"type": "integer", "description": "Start character offset (0-indexed). Use with char_count only."},
-                        "char_count": {"type": "integer", "description": "Number of characters to retrieve (>0)."}
-                    },
-                    "required": ["cache_id"]
-                }
-            }
-        },
-        {
-            "type": "function", "function": {
-                "name": "get_cache_info",
-                "description": "Inspect a cached output: returns total lines, total chars, and a short preview of the first 10 lines.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
-                    },
-                    "required": ["cache_id"]
-                }
-            }
-        },
-        {
-            "type": "function", "function": {
-                "name": "drop_cache",
-                "description": "Delete a cached output to free memory.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
-                    },
-                    "required": ["cache_id"]
-                }
-            }
-        }
+        {"type": "function", "function": {"name": "python", "description": "Executes Python code for file I/O, data manipulation, and logic. NOTE: If the output is very large, it will be cached and a cache_id will be returned.", "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "The Python code to execute."}}, "required": ["code"]}}},
+        {"type": "function", "function": {"name": "shell", "description": f"Executes a {shell_name} command for tasks like running external programs. NOTE: If the output is very large, it will be cached and a cache_id will be returned. {shell_examples}", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute."}}, "required": ["command"]}}},
+        {"type": "function", "function": {"name": "view_cached_output", "description": "Retrieve a portion of large, cached output from a previous `python` or `shell` call. Choose exactly one mode: line mode OR char mode.", "parameters": {"type": "object", "properties": {"cache_id": {"type": "string", "description": "Unique ID of the cached output."}, "start_line": {"type": "integer", "description": "Start line (0-indexed). Use with line_count only."}, "line_count": {"type": "integer", "description": "Number of lines to retrieve (>0)."}, "before_lines": {"type": "integer", "description": "Optional extra context lines to include BEFORE the window (>=0)."}, "after_lines": {"type": "integer", "description": "Optional extra context lines to include AFTER the window (>=0)."}, "start_char": {"type": "integer", "description": "Start character offset (0-indexed). Use with char_count only."}, "char_count": {"type": "integer", "description": "Number of characters to retrieve (>0)."}}, "required": ["cache_id"]}}},
+        {"type": "function", "function": {"name": "get_cache_info", "description": "Inspect a cached output: returns total lines, total chars, and a short preview of the first 10 lines.", "parameters": {"type": "object", "properties": {"cache_id": {"type": "string", "description": "Unique ID of the cached output."}}, "required": ["cache_id"]}}},
+        {"type": "function", "function": {"name": "drop_cache", "description": "Delete a cached output to free memory.", "parameters": {"type": "object", "properties": {"cache_id": {"type": "string", "description": "Unique ID of the cached output."}}, "required": ["cache_id"]}}}
     ]
 
+    # --- Initial Setup for Harmony Messages ---
+    # This is an example instruction. You can change it.
+    instructions = "You are a helpful assistant that can execute code."
+    system_message = create_system_message(tools_exist=True)
+    developer_message = create_developer_message(instructions, tools_definition)
+    
+    # The first two messages are always the system and developer messages
+    conversation_history.append({"role": "system", "content": system_message})
+    conversation_history.append({"role": "user", "content": developer_message})
+
+
     # --- Main Conversation Loop ---
+    console.print(Panel(f"[bold green]Harmony CLI Initialized[/bold green]\n\n[dim]System and developer messages have been pre-loaded.[/dim]\n[dim]Enter your first prompt or type 'exit' to quit.[/dim]"))
     while True:
         try:
-            user_input = console.input("\n[bold cyan]You: ")
+            user_input = console.input("\n[bold cyan]You: [/bold cyan]")
             if user_input.lower() == 'exit':
                 break
         except (KeyboardInterrupt, EOFError):
@@ -134,6 +95,7 @@ def main():
             
         conversation_history.append({"role": "user", "content": user_input})
 
+        # --- Loop for tool calls until a final text answer is given ---
         while True:
             full_response_content = ""
             tool_calls_in_progress = []
@@ -141,7 +103,6 @@ def main():
 
             console.print("\n[bold yellow]Assistant:[/bold yellow]", end=" ")
             
-            # The API call uses the full history, which now includes our Harmony messages.
             for chunk in stream_model_response(conversation_history, tools_definition):
                 if not chunk.get("choices"):
                     continue
@@ -189,28 +150,37 @@ def main():
 
             if tool_calls_in_progress:
                 console.rule("\n[bold blue]Tool Results[/bold blue]", style="blue")
+                tool_results = []
                 for tool_call in tool_calls_in_progress:
                     function_name = tool_call["function"]["name"]
+                    tool_call_id = tool_call["id"]
                     try:
                         args_str = tool_call["function"]["arguments"]
                         if not args_str:
-                            console.print(Panel(f"Error executing tool {function_name}: Arguments are empty.", title="[bold red]Error[/bold red]", border_style="red"))
+                            error_message = f"Error executing tool {function_name}: Arguments are empty."
+                            console.print(Panel(error_message, title="[bold red]Error[/bold red]", border_style="red"))
+                            tool_results.append({"tool_call_id": tool_call_id, "role": "tool", "name": function_name, "content": error_message})
                             continue
                         
                         args = json.loads(args_str)
-                        tool_function = AVAILABLE_TOOLS[function_name]
+                        
+                        # *** THIS IS THE CORRECTED TOOL EXECUTION LOGIC ***
+                        tool_output = tool_executor.execute_tool(function_name, **args)
+                        
+                        model_content = tool_output # Default content for the model
+                        display_output = tool_output # Default content for the user display
 
+                        # --- Handle large outputs for python and shell tools ---
                         if function_name in ["python", "shell"] and len(tool_output) > MAX_TOOL_OUTPUT_CHARS:
                             cache_id = str(uuid.uuid4())
-                            TOOL_OUTPUT_CACHE[cache_id] = tool_output
-                            
+                            tool_executor.cache[cache_id] = tool_output
                             total_lines = len(tool_output.splitlines())
                             
                             model_content = (
                                 f"## Command Successful, Output Too Large\n"
                                 f"The full output is {total_lines} lines long and has been cached.\n"
                                 f"Cache ID: '{cache_id}'\n"
-                                f"You MUST now use the `view_cached_output` tool with this ID to inspect the output."
+                                f"You MUST now use the `get_cache_info` or `view_cached_output` tool with this ID to inspect the output."
                             )
                             
                             display_output = (
@@ -219,25 +189,31 @@ def main():
                                 f"--- Start of Output ---\n" +
                                 _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
                             )
-                        else:
-                            display_output = _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
-
+                        
                         markdown_output = Markdown(display_output)
                         console.print(Panel(markdown_output, title=f"[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
                         
-                        # The content of a tool message must be a JSON-encoded string.
-                        conversation_history.append({
-                            "tool_call_id": tool_call["id"],
+                        tool_results.append({
+                            "tool_call_id": tool_call_id,
                             "role": "tool",
                             "name": function_name,
+                            "content": model_content, 
                         })
-                    except json.JSONDecodeError as e:
-                        console.print(Panel(f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}", title="[bold red]Argument Error[/bold red]", border_style="red"))
-                    except Exception as e:
-                        console.print(Panel(f"Error executing tool {function_name}: {e}", title="[bold red]Execution Error[/bold red]", border_style="red"))
-                
-                continue
 
+                    except json.JSONDecodeError as e:
+                        error_msg = f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}"
+                        console.print(Panel(error_msg, title="[bold red]Argument Error[/bold red]", border_style="red"))
+                        tool_results.append({"tool_call_id": tool_call_id, "role": "tool", "name": function_name, "content": error_msg})
+                    except Exception as e:
+                        error_msg = f"Error executing tool {function_name}: {e}"
+                        console.print(Panel(error_msg, title="[bold red]Execution Error[/bold red]", border_style="red"))
+                        tool_results.append({"tool_call_id": tool_call_id, "role": "tool", "name": function_name, "content": error_msg})
+                
+                # Append all tool results to the history before the next model call
+                conversation_history.extend(tool_results)
+                continue # Continue the inner loop to get the model's response to the tool results
+
+            # If there were no tool calls, the model has given its final answer, so break the inner loop.
             break
 
     console.print("\n[bold red]Exiting.[/bold red]")
