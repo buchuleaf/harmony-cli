@@ -4,143 +4,213 @@ import subprocess
 import json
 import os
 
-def read_file(file_path: str, start_line: int = None, end_line: int = None) -> str:
+# --- Constants for Truncation ---
+MAX_TOOL_OUTPUT_LINES = 15
+MAX_LINE_LENGTH = 150
+
+# --- Helper Functions ---
+
+def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
     """
-    Reads the content of a file, optionally from a specific start to end line.
-    Line numbers in the output are 1-based and correspond to the original file.
+    Truncates a string for clean display by limiting both the number of lines
+    and the length of each individual line.
     """
-    if not os.path.exists(file_path):
-        return f"### Error Reading File\nFile not found at '{file_path}'."
-    
-    # --- Input Validation ---
-    if start_line is not None and start_line <= 0:
-        return "### Error Reading File\n`start_line` must be a positive number."
-    if end_line is not None and end_line <= 0:
-        return "### Error Reading File\n`end_line` must be a positive number."
-    if start_line and end_line and start_line > end_line:
-        return f"### Error Reading File\n`start_line` ({start_line}) cannot be greater than `end_line` ({end_line})."
+    lines = output.splitlines()
+    original_line_count = len(lines)
 
-    try:
-        with open(file_path, 'r') as f:
-            all_lines = f.readlines()
-        
-        total_lines = len(all_lines)
-        
-        # Determine the slice range (0-based for Python lists)
-        start_index = (start_line - 1) if start_line else 0
-        end_index = end_line if end_line else total_lines
-        
-        # Clamp the range to the actual file size to prevent errors
-        start_index = max(0, start_index)
-        end_index = min(total_lines, end_index)
+    if original_line_count > max_lines:
+        lines = lines[:max_lines]
+        omitted_lines = original_line_count - max_lines
+        truncation_message = f"\n... (output truncated, {omitted_lines} more lines hidden) ..."
+    else:
+        truncation_message = ""
 
-        lines_to_show = all_lines[start_index:end_index]
-
-        if not lines_to_show:
-            return f"### Content of `{file_path}`\n(No content in the specified range: {start_line}-{end_line})"
-
-        max_line_number_width = len(str(end_index))
-        
-        formatted_lines = []
-        # Enumerate starting from the actual start line number for correct display
-        for i, line in enumerate(lines_to_show, start=start_index + 1):
-            line_number = str(i).rjust(max_line_number_width)
-            formatted_lines.append(f"{line_number}: {line.rstrip()}")
-        
-        content_with_lines = "\n".join(formatted_lines)
-        
-        # Create a dynamic header
-        if start_line or end_line:
-            header = f"### Showing lines {start_index + 1}-{end_index} of `{file_path}` (Total: {total_lines} lines)"
+    processed_lines = []
+    for line in lines:
+        if len(line) > max_line_length:
+            processed_lines.append(line[:max_line_length] + " ... (line truncated) ...")
         else:
-            header = f"### Content of `{file_path}` (Total: {total_lines} lines)"
+            processed_lines.append(line)
 
-        return f"{header}\n```\n{content_with_lines}\n```"
+    return "\n".join(processed_lines) + truncation_message
 
-    except Exception as e:
-        return f"### Error Reading File\nAn unexpected error occurred: {str(e)}"
 
-# ... (the rest of tools.py remains the same) ...
 def _format_shell_output(result: subprocess.CompletedProcess) -> str:
     """Formats the result of a subprocess command into a structured Markdown string."""
+    output = ""
     if result.returncode == 0:
-        output = "### Shell Command Successful\n"
-        if result.stdout:
-            output += f"#### STDOUT\n```\n{result.stdout.strip()}\n```\n"
-        if result.stderr:
-            output += f"#### STDERR\n```\n{result.stderr.strip()}\n```\n"
-        if not result.stdout and not result.stderr:
-            output += "The command produced no output.\n"
+        output += "## Command Successful\n"
+        if result.stdout: output += f"### STDOUT\n```\n{result.stdout.lstrip('\\n').rstrip()}\n```\n"
+        if result.stderr: output += f"### STDERR\n```\n{result.stderr.lstrip('\\n').rstrip()}\n```\n"
+        if not result.stdout and not result.stderr: output += "The command produced no output.\n"
     else:
-        output = f"### Shell Command FAILED (Exit Code: {result.returncode})\n"
-        if result.stderr:
-            output += f"#### STDERR\n```\n{result.stderr.strip()}\n```\n"
-        if result.stdout:
-            output += f"#### STDOUT\n```\n{result.stdout.strip()}\n```\n"
-        if not result.stdout and not result.stderr:
-            output += "The command produced no output.\n"
-            
+        output += f"## Command FAILED (Exit Code: {result.returncode})\n"
+        if result.stderr: output += f"### STDERR\n```\n{result.stderr.lstrip('\\n').rstrip()}\n```\n"
+        if result.stdout: output += f"### STDOUT\n```\n{result.stdout.lstrip('\\n').rstrip()}\n```\n"
+        if not result.stdout and not result.stderr: output += "The command produced no output.\n"
     return output
 
-def shell(command: str) -> str:
-    """Executes a shell command and returns a formatted Markdown string of the output."""
+# --- Core Tools ---
+
+def python(code: str) -> str:
+    """
+    Executes a string of Python code and returns the output.
+    This is the PREFERRED tool for all tasks involving file manipulation, data processing, or complex logic.
+    """
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            ["python", "-c", code], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
+        )
         return _format_shell_output(result)
-    except subprocess.TimeoutExpired:
-        return "### Shell Command FAILED\nError: Command timed out after 30 seconds."
+    except Exception as e:
+        return f"## Python Execution FAILED\nError: An unexpected error occurred: {str(e)}"
+
+def shell(command: str) -> str:
+    """
+    Executes a shell command. Use this ONLY for tasks that CANNOT be done with Python.
+    """
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
+        )
+        return _format_shell_output(result)
     except Exception as e:
         return f"### Shell Command FAILED\nError: An unexpected error occurred: {str(e)}"
 
-def file_patch(file_path: str, patch: str) -> str:
+def get_cache_info(cache: dict, cache_id: str) -> str:
     """
-    Applies a patch to a file to add, remove, or modify its content.
-
-    The patch format is a simplified diff-like format where each line starts
-    with '+', '-', or ' ' to indicate addition, removal, or context, respectively.
-
-    Args:
-        file_path: The path to the file to be patched.
-        patch: A string representing the patch to apply.
-               For example, to replace 'old_line' with 'new_line', the patch
-               string would be '-old_line\\n+new_line'.
-
-    Returns:
-        A success message if the patch is applied, or an error message otherwise.
+    Returns total lines, total chars, and a preview for a given cache entry.
     """
-    if not patch or not patch.strip():
-        return "### Error Patching File\nThe 'patch' argument cannot be empty. No changes were made."
+    if cache_id not in cache:
+        return f"## Error\nCache ID '{cache_id}' not found."
+    full_output = cache[cache_id]
+    total_chars = len(full_output)
+    lines = full_output.splitlines()
+    total_lines = len(lines)
+    head = "\n".join(lines[:10])
+    return (
+        f"## Cache Info (ID: {cache_id})\n"
+        f"- total_lines: {total_lines}\n"
+        f"- total_chars: {total_chars}\n"
+        "### Preview (first 10 lines)\n```\n" + head + "\n```"
+    )
 
-    if not os.path.exists(file_path):
-        return f"### Error Patching File\nFile not found at '{file_path}'."
-    try:
-        with open(file_path, 'r') as f:
-            original_lines = f.readlines()
+def drop_cache(cache: dict, cache_id: str) -> str:
+    """
+    Deletes a cache entry to free memory.
+    """
+    if cache_id not in cache:
+        return f"## Error\nCache ID '{cache_id}' not found."
+    del cache[cache_id]
+    return f"## OK\nCache '{cache_id}' dropped."
 
-        patched_lines = []
-        original_line_index = 0
-        patch_lines = patch.splitlines()
-        patch_lines = [line for line in patch_lines if not (line.startswith('---') or line.startswith('+++') or line.startswith('@@'))]
+def view_cached_output(
+    cache: dict,
+    cache_id: str,
+    start_line: int = None,
+    line_count: int = None,
+    before_lines: int = 0,
+    after_lines: int = 0,
+    start_char: int = None,
+    char_count: int = None,
+) -> str:
+    """
+    Retrieve a specific portion of a large tool output that has been cached.
+    Supports either line-based or character-based ranges, but not both in one call.
 
-        for line in patch_lines:
-            if line.startswith('+'):
-                patched_lines.append(line[1:] + '\n')
-            elif line.startswith('-'):
-                original_line_index += 1
-            else: 
-                if original_line_index < len(original_lines):
-                    patched_lines.append(original_lines[original_line_index])
-                    original_line_index += 1
+    Modes:
+      • Line mode: start_line, line_count[, before_lines, after_lines]
+      • Char mode: start_char, char_count
+    """
+    if cache_id not in cache:
+        return f"## Error\nCache ID '{cache_id}' not found."
 
-        with open(file_path, 'w') as f:
-            f.writelines(patched_lines)
-            
-        return f"File patched successfully: '{file_path}'."
-    except Exception as e:
-        return f"### Error Patching File\nAn unexpected error occurred while patching '{file_path}': {str(e)}"
+    full_output = cache[cache_id]
+
+    # --- Enforce exclusive mode selection
+    line_params_present = (start_line is not None) or (line_count is not None) or (before_lines not in (None, 0)) or (after_lines not in (None, 0))
+    char_params_present = (start_char is not None) or (char_count is not None)
+    if line_params_present and char_params_present:
+        return (
+            "## Error\n"
+            "You provided both line-based and character-based parameters. "
+            "Choose exactly one mode: either (start_line, line_count[, before_lines, after_lines]) "
+            "or (start_char, char_count)."
+        )
+
+    # --- Character-based mode ---
+    if char_params_present:
+        if start_char is None or char_count is None:
+            return "## Error\nChar mode requires both `start_char` and `char_count`."
+        if start_char < 0:
+            return "## Error\n`start_char` must be >= 0."
+        total_chars = len(full_output)
+        if start_char >= total_chars:
+            return (
+                "## Error\n"
+                f"`start_char` out of bounds. Valid range: [0, {total_chars - 1}] "
+                f"(the output has {total_chars} characters, 0-indexed)."
+            )
+        if char_count <= 0:
+            return "## Error\n`char_count` must be > 0."
+        end_char = min(start_char + char_count, total_chars)
+        chunk = full_output[start_char:end_char]
+        return (
+            f"## Viewing Cached Output (ID: {cache_id})\n"
+            f"Showing characters {start_char} to {end_char - 1} of {total_chars - 1}.\n"
+            "```\n"
+            + chunk
+            + "\n```"
+        )
+
+    # --- Line-based mode (default) ---
+    if line_count is None:
+        line_count = 100
+    if start_line is None:
+        start_line = 0
+    if line_count <= 0:
+        return "## Error\n`line_count` must be > 0."
+    if before_lines is None or before_lines < 0:
+        return "## Error\n`before_lines` must be >= 0."
+    if after_lines is None or after_lines < 0:
+        return "## Error\n`after_lines` must be >= 0."
+
+    lines = full_output.splitlines()
+    total_lines = len(lines)
+
+    if start_line < 0 or start_line >= total_lines:
+        suggestion = max(0, min(start_line, total_lines - 1))
+        return (
+            "## Error\n"
+            f"`start_line` out of bounds. Valid range: [0, {total_lines - 1}]. "
+            f"The output has {total_lines} lines (0-indexed). "
+            f"Try `start_line={suggestion}`."
+        )
+
+    # Expand window with before/after context (bounded to file)
+    start_idx = max(0, start_line - (before_lines or 0))
+    end_idx = min(total_lines, (start_line + line_count) + (after_lines or 0))
+    selected_lines = lines[start_idx:end_idx]
+    chunk_str = "\n".join(selected_lines)
+
+    # Only apply line-aware truncation in line mode (char mode is returned raw)
+    truncated_chunk = _truncate_output(chunk_str, max_lines=(end_idx - start_idx), max_line_length=MAX_LINE_LENGTH)
+
+    return (
+        f"## Viewing Cached Output (ID: {cache_id})\n"
+        f"Showing lines {start_idx} to {end_idx - 1} of {total_lines - 1}.\n"
+        f"(Requested: start_line={start_line}, line_count={line_count}, before_lines={before_lines}, after_lines={after_lines})\n"
+        "```\n"
+        + truncated_chunk
+        + "\n```"
+    )
+
+# --- Tool Registration ---
 
 AVAILABLE_TOOLS = {
-    "read_file": read_file,
+    "python": python,
     "shell": shell,
-    "file_patch": file_patch,
+    "view_cached_output": view_cached_output,
+    "get_cache_info": get_cache_info,
+    "drop_cache": drop_cache,
 }
