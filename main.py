@@ -3,27 +3,19 @@
 import json
 import requests
 import platform
-from tools import AVAILABLE_TOOLS
+import uuid
+from tools import AVAILABLE_TOOLS, _truncate_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH
 from rich.console import Console
 from rich.panel import Panel
+from rich.markdown import Markdown
 
 # --- Constants and Global Setup ---
 API_URL = "http://localhost:8080/v1/chat/completions"
-MAX_TOOL_OUTPUT_LINES = 10
+MAX_TOOL_OUTPUT_CHARS = 8000
 console = Console()
 
-
-def truncate_for_display(output: str, max_lines: int) -> str:
-    """
-    Truncates a string to a maximum number of lines for cleaner display.
-    """
-    lines = output.splitlines()
-    if len(lines) > max_lines:
-        truncated_content = "\n".join(lines[:max_lines])
-        omitted_lines = len(lines) - max_lines
-        truncation_message = f"\n... (output truncated, {omitted_lines} more lines hidden) ..."
-        return truncated_content + truncation_message
-    return output
+# A simple in-memory cache for the current session
+TOOL_OUTPUT_CACHE = {}
 
 
 def stream_model_response(messages, tools):
@@ -58,32 +50,95 @@ def stream_model_response(messages, tools):
 
 
 def main():
-    # --- System Information ---
+    # --- System Information and Dynamic Tool Configuration ---
     system = platform.system()
     if system == "Windows":
         os_name = "Windows"
         shell_name = "PowerShell"
+        shell_examples = "e.g., `Get-ChildItem` to list files, `Select-String -Path path/to/file.txt -Pattern 'hello'` to search text."
     elif system == "Darwin":
         os_name = "macOS"
         shell_name = "bash"
+        shell_examples = "e.g., `ls -l` to list files, `grep 'hello' path/to/file.txt` to search text."
     else:
         os_name = "Linux"
         shell_name = "bash"
+        shell_examples = "e.g., `ls -l` to list files, `grep 'hello' path/to/file.txt` to search text."
     
+    # --- Tool Definitions for the Model ---
     tools_definition = [
-        {"type": "function", "function": {"name": "read_file", "description": "Reads the content of a file. Can read the entire file or a specific range of lines.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string", "description": "The path to the file to read."}, "start_line": {"type": "integer", "description": "Optional. The 1-based line number to start reading from."}, "end_line": {"type": "integer", "description": "Optional. The 1-based line number to stop reading at (inclusive)."}}, "required": ["file_path"]}}},
-        {"type": "function", "function": {"name": "shell", "description": "Executes a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to execute."}}, "required": ["command"]}}},
-        {"type": "function", "function": {"name": "file_patch", "description": "Applies a patch to a file to add, remove, or modify its content using a diff-like format. This is useful for making specific changes to a file without rewriting the entire file.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string", "description": "The path to the file to patch."}, "patch": {"type": "string", "description": "The patch content. Each line should start with a `+` for additions, `-` for removals, or a space for context. For example, to replace the line 'old_line' with 'new_line', the patch would be '-old_line\\n+new_line'."}}, "required": ["file_path", "patch"]}}}
-    ]
-
-    # --- Conversation History ---
-    conversation_history = [
         {
-            "role": "system",
-            "content": f"You are running in a {os_name} environment. The available shell is {shell_name}."
+            "type": "function",
+            "function": {
+                "name": "python",
+                "description": "Executes Python code to perform tasks like file I/O, data manipulation, and complex logic. This is the primary tool for most operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "The Python code to execute."}
+                    },
+                    "required": ["code"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": f"Executes a {shell_name} command as a fallback for tasks impossible in Python, like running external programs (`git`, `curl`), or managing system processes. {shell_examples}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The shell command to execute."}
+                    },
+                    "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "view_cached_output",
+                "description": "Retrieves and displays a specific portion (a 'page') of a large tool output that was previously cached. Use this to browse or search through large results from `python` or `shell` commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cache_id": {"type": "string", "description": "The unique ID of the cached output to view."},
+                        "start_line": {"type": "integer", "description": "The starting line number to retrieve (0-indexed). Defaults to 0."},
+                        "line_count": {"type": "integer", "description": "The number of lines to retrieve. Defaults to 100."}
+                    },
+                    "required": ["cache_id"]
+                }
+            }
         }
     ]
-    console.print(Panel("GPT-OSS API CLI (Stable UI)", style="bold green", expand=False))
+
+    # --- System Prompt and Conversation History ---
+    # --- CRITICAL FIX: OS-AWARE SYSTEM PROMPT ---
+    if os_name == "Windows":
+        system_prompt = f"""You are a terminal assistant in a {os_name} environment with a {shell_name} shell. You have three tools: `python`, `shell`, and `view_cached_output`.
+
+FILE PATH RULES:
+1. For the `python` tool, ALWAYS use forward slashes (`/`) for file paths, like `path/to/file.txt`.
+2. For the `shell` tool, you MUST use backslashes (`\\`) for file paths, like `path\\to\\file.exe`. This is critical for Windows commands.
+
+LARGE OUTPUT WORKFLOW:
+- If a command's output is too large, it will be cached and you will receive a `cache_id`.
+- You MUST use the `view_cached_output` tool with the `cache_id` to inspect the output in chunks."""
+    else: # For Linux and macOS
+        system_prompt = f"""You are a terminal assistant in a {os_name} environment with a {shell_name} shell. You have three tools: `python`, `shell`, and `view_cached_output`.
+
+FILE PATH RULE:
+- For ALL tools (`python` and `shell`), you MUST use forward slashes (`/`) for file paths, like `path/to/file.txt`.
+
+LARGE OUTPUT WORKFLOW:
+- If a command's output is too large, it will be cached and you will receive a `cache_id`.
+- You MUST use the `view_cached_output` tool with the `cache_id` to inspect the output in chunks."""
+
+
+    conversation_history = [{"role": "system", "content": system_prompt}]
+    
+    console.print(Panel("GPT-OSS API CLI", style="bold green", expand=False))
 
     # --- Main Conversation Loop ---
     while True:
@@ -96,75 +151,54 @@ def main():
             
         conversation_history.append({"role": "user", "content": user_input})
 
-        # --- Model Response Loop ---
-        # This loop continues until the model provides a text response without calling a tool.
         while True:
-            # --- State Initialization for each response ---
             full_response_content = ""
             tool_calls_in_progress = []
-            # Tracks which parts of a tool call have been printed to avoid duplicates.
-            tool_print_state = {}  # {index: {"name_printed": bool}}
+            tool_print_state = {}
 
             console.print("\n[bold yellow]Assistant:[/bold yellow]", end=" ")
             
-            # --- Stream and process the model's response chunk by chunk ---
             for chunk in stream_model_response(conversation_history, tools_definition):
-                if not chunk.get("choices"):
-                    continue
-                
+                if not chunk.get("choices"): continue
                 delta = chunk["choices"][0].get("delta", {})
 
-                # --- Stream Text Content ---
                 if "content" in delta and delta["content"]:
                     content_chunk = delta["content"]
                     full_response_content += content_chunk
                     console.print(content_chunk, end="", style="white", highlight=False)
                 
-                # --- Assemble and Stream Tool Calls ---
                 if "tool_calls" in delta and delta["tool_calls"]:
                     for tool_call_chunk in delta["tool_calls"]:
                         index = tool_call_chunk["index"]
                         
-                        # Initialize state for a new tool call
                         if len(tool_calls_in_progress) <= index:
                             tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                         if index not in tool_print_state:
                             tool_print_state[index] = {"name_printed": False}
 
-                        # Update the tool call object with the new data
-                        if "id" in tool_call_chunk:
-                            tool_calls_in_progress[index]["id"] = tool_call_chunk["id"]
+                        if "id" in tool_call_chunk: tool_calls_in_progress[index]["id"] = tool_call_chunk["id"]
                         if "function" in tool_call_chunk:
-                            if "name" in tool_call_chunk["function"]:
-                                tool_calls_in_progress[index]["function"]["name"] = tool_call_chunk["function"]["name"]
-                            if "arguments" in tool_call_chunk["function"]:
-                                tool_calls_in_progress[index]["function"]["arguments"] += tool_call_chunk["function"]["arguments"]
+                            if "name" in tool_call_chunk["function"]: tool_calls_in_progress[index]["function"]["name"] = tool_call_chunk["function"]["name"]
+                            if "arguments" in tool_call_chunk["function"]: tool_calls_in_progress[index]["function"]["arguments"] += tool_call_chunk["function"]["arguments"]
 
-                        # --- Stream the tool call's visual representation ---
-                        # Print the function name and opening parenthesis once
                         if not tool_print_state[index]["name_printed"] and tool_calls_in_progress[index]["function"]["name"]:
                             console.print(f"\n\n[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[index]['function']['name']}(", end="", highlight=False)
                             tool_print_state[index]["name_printed"] = True
 
-                        # Stream the arguments as they arrive
                         if "function" in tool_call_chunk and "arguments" in tool_call_chunk["function"]:
                             console.print(tool_call_chunk["function"]["arguments"], end="", style="blue", highlight=False)
 
-            # --- Finalize Streaming Output ---
-            # Close any open tool call parentheses
             for index in sorted(tool_print_state.keys()):
                 if tool_print_state[index]["name_printed"]:
                     console.print(")", end="", style="blue")
             
-            console.print()  # Print a final newline for clean separation
+            console.print()
 
-            # --- Prepare and store the assistant's message ---
             assistant_message = {"role": "assistant", "content": full_response_content or None}
             if tool_calls_in_progress:
                 assistant_message["tool_calls"] = tool_calls_in_progress
             conversation_history.append(assistant_message)
 
-            # --- Execute Tools if any were called ---
             if tool_calls_in_progress:
                 console.rule("\n[bold blue]Tool Results[/bold blue]", style="blue")
                 for tool_call in tool_calls_in_progress:
@@ -177,26 +211,55 @@ def main():
                         
                         args = json.loads(args_str)
                         tool_function = AVAILABLE_TOOLS[function_name]
-                        tool_output = tool_function(**args)
-                        display_output = truncate_for_display(tool_output, MAX_TOOL_OUTPUT_LINES)
+                        
+                        if function_name == "view_cached_output":
+                            tool_output = tool_function(cache=TOOL_OUTPUT_CACHE, **args)
+                        else:
+                            tool_output = tool_function(**args)
+                        
+                        model_content = tool_output
+                        display_output = tool_output
 
-                        console.print(Panel(display_output, title=f"\n[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
+                        if function_name in ["python", "shell"] and len(tool_output) > MAX_TOOL_OUTPUT_CHARS:
+                            cache_id = str(uuid.uuid4())
+                            TOOL_OUTPUT_CACHE[cache_id] = tool_output
+                            
+                            lines = tool_output.splitlines()
+                            total_lines = len(lines)
+                            
+                            model_content = (
+                                f"## Command Successful, Output Too Large\n"
+                                f"The full output is {total_lines} lines long and has been cached.\n"
+                                f"Cache ID: '{cache_id}'\n"
+                                f"Instruct the user that the output is large and use the `view_cached_output` tool with this ID to inspect it."
+                            )
+                            
+                            display_output = (
+                                f"Output is too large ({total_lines} lines) and has been cached for the model to browse.\n"
+                                f"Cache ID: {cache_id}\n\n"
+                                f"--- Start of Output ---\n" +
+                                _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
+                            )
+
+                        if display_output is tool_output:
+                             display_output = _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
+
+                        markdown_output = Markdown(display_output)
+                        console.print(Panel(markdown_output, title=f"[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
 
                         conversation_history.append({
                             "tool_call_id": tool_call["id"],
                             "role": "tool",
                             "name": function_name,
-                            "content": tool_output,
+                            "content": model_content,
                         })
                     except json.JSONDecodeError as e:
                         console.print(Panel(f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}", title="[bold red]Argument Error[/bold red]", border_style="red"))
                     except Exception as e:
                         console.print(Panel(f"Error executing tool {function_name}: {e}", title="[bold red]Execution Error[/bold red]", border_style="red"))
                 
-                # Loop back to the model with the tool results
                 continue
 
-            # If no tools were called, break the inner loop and wait for user input
             break
 
     console.print("\n[bold red]Exiting.[/bold red]")
