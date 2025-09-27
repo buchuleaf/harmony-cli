@@ -4,36 +4,63 @@ import subprocess
 import json
 import os
 
-def read_file(file_path: str) -> str:
+def read_file(file_path: str, start_line: int = None, end_line: int = None) -> str:
     """
-    Reads the content of a file and returns it with line numbers in a formatted Markdown string.
+    Reads the content of a file, optionally from a specific start to end line.
+    Line numbers in the output are 1-based and correspond to the original file.
     """
     if not os.path.exists(file_path):
         return f"### Error Reading File\nFile not found at '{file_path}'."
+    
+    # --- Input Validation ---
+    if start_line is not None and start_line <= 0:
+        return "### Error Reading File\n`start_line` must be a positive number."
+    if end_line is not None and end_line <= 0:
+        return "### Error Reading File\n`end_line` must be a positive number."
+    if start_line and end_line and start_line > end_line:
+        return f"### Error Reading File\n`start_line` ({start_line}) cannot be greater than `end_line` ({end_line})."
+
     try:
         with open(file_path, 'r') as f:
-            lines = f.readlines()
+            all_lines = f.readlines()
         
-        if not lines:
-            return f"### Content of `{file_path}`\n(File is empty)"
+        total_lines = len(all_lines)
+        
+        # Determine the slice range (0-based for Python lists)
+        start_index = (start_line - 1) if start_line else 0
+        end_index = end_line if end_line else total_lines
+        
+        # Clamp the range to the actual file size to prevent errors
+        start_index = max(0, start_index)
+        end_index = min(total_lines, end_index)
 
-        # Calculate the padding needed for the line numbers for clean alignment
-        max_line_number_width = len(str(len(lines)))
+        lines_to_show = all_lines[start_index:end_index]
+
+        if not lines_to_show:
+            return f"### Content of `{file_path}`\n(No content in the specified range: {start_line}-{end_line})"
+
+        max_line_number_width = len(str(end_index))
         
-        # Format each line with its number
         formatted_lines = []
-        for i, line in enumerate(lines):
-            # Format: "  1: content of line 1"
-            # rstrip() removes the original newline character from the read line
-            line_number = str(i + 1).rjust(max_line_number_width)
+        # Enumerate starting from the actual start line number for correct display
+        for i, line in enumerate(lines_to_show, start=start_index + 1):
+            line_number = str(i).rjust(max_line_number_width)
             formatted_lines.append(f"{line_number}: {line.rstrip()}")
         
         content_with_lines = "\n".join(formatted_lines)
         
-        return f"### Content of `{file_path}`\n```\n{content_with_lines}\n```"
+        # Create a dynamic header
+        if start_line or end_line:
+            header = f"### Showing lines {start_index + 1}-{end_index} of `{file_path}` (Total: {total_lines} lines)"
+        else:
+            header = f"### Content of `{file_path}` (Total: {total_lines} lines)"
+
+        return f"{header}\n```\n{content_with_lines}\n```"
+
     except Exception as e:
         return f"### Error Reading File\nAn unexpected error occurred: {str(e)}"
 
+# ... (the rest of tools.py remains the same) ...
 def _format_shell_output(result: subprocess.CompletedProcess) -> str:
     """Formats the result of a subprocess command into a structured Markdown string."""
     if result.returncode == 0:
@@ -66,7 +93,21 @@ def shell(command: str) -> str:
         return f"### Shell Command FAILED\nError: An unexpected error occurred: {str(e)}"
 
 def file_patch(file_path: str, patch: str) -> str:
-    """Applies a patch to a file and returns a simple success or error message."""
+    """
+    Applies a patch to a file to add, remove, or modify its content.
+
+    The patch format is a simplified diff-like format where each line starts
+    with '+', '-', or ' ' to indicate addition, removal, or context, respectively.
+
+    Args:
+        file_path: The path to the file to be patched.
+        patch: A string representing the patch to apply.
+               For example, to replace 'old_line' with 'new_line', the patch
+               string would be '-old_line\\n+new_line'.
+
+    Returns:
+        A success message if the patch is applied, or an error message otherwise.
+    """
     if not patch or not patch.strip():
         return "### Error Patching File\nThe 'patch' argument cannot be empty. No changes were made."
 
