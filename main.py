@@ -3,22 +3,12 @@
 import json
 import requests
 import platform
-import uuid
-from tools import AVAILABLE_TOOLS, _truncate_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH
-# Import the new Harmony formatting functions
-from harmony import create_system_message, create_developer_message
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
 
 # --- Constants and Global Setup ---
 API_URL = "http://localhost:8080/v1/chat/completions"
-MAX_TOOL_OUTPUT_CHARS = 8000
-console = Console()
-
-# A simple in-memory cache for the current session
-TOOL_OUTPUT_CACHE = {}
-
 
 def stream_model_response(messages, tools):
     """
@@ -51,22 +41,7 @@ def stream_model_response(messages, tools):
         console.print(f"\n[Error connecting to the model API: {e}]", style="bold red")
 
 
-def main():
-    # --- System Information and Dynamic Tool Configuration ---
-    system = platform.system()
-    if system == "Windows":
-        os_name = "Windows"
-        shell_name = "PowerShell"
-        shell_examples = "e.g., `Get-ChildItem` to list files, `Select-String -Path path\\to\\file.txt -Pattern 'hello'` to search text."
-    elif system == "Darwin":
-        os_name = "macOS"
-        shell_name = "bash"
-        shell_examples = "e.g., `ls -l` to list files, `grep 'hello' path/to/file.txt` to search text."
-    else:
-        os_name = "Linux"
-        shell_name = "bash"
-        shell_examples = "e.g., `ls -l` to list files, `grep 'hello' path/to/file.txt` to search text."
-    
+def main():    
     # --- Tool Definitions for the Model ---
     # This remains as JSON because it's passed directly to the OpenAI-compatible API.
     # Our harmony.py library will convert this into the text format for the developer message.
@@ -148,41 +123,6 @@ def main():
         }
     ]
 
-    # --- HARMONY-COMPLIANT PROMPT CONSTRUCTION ---
-    # The Harmony format splits the system prompt into two distinct roles: 'system' and 'developer'.
-    
-    # Define the core instructions for the developer message.
-    if os_name == "Windows":
-        instructions = f"""You are a terminal assistant in a {os_name} environment.
-For the `python` tool, ALWAYS use forward slashes (`/`) for file paths.
-For the `shell` tool, YOU MUST use backslashes (`\\`) for file paths.
-
-Cache browsing:
-- Prefer line mode for logs/code; char mode for precise byte/offset slicing.
-- Choose exactly one mode per call: (start_line, line_count[, before_lines, after_lines]) OR (start_char, char_count).
-"""
-    else:  # Linux and macOS
-        instructions = f"""You are a terminal assistant in a {os_name} environment.
-For ALL tools (`python` and `shell`), YOU MUST use forward slashes (`/`) for file paths.
-
-Cache browsing:
-- Prefer line mode for logs/code; char mode for precise byte/offset slicing.
-- Choose exactly one mode per call: (start_line, line_count[, before_lines, after_lines]) OR (start_char, char_count).
-"""
-
-    # Use the new helper functions to create the initial messages.
-    harmony_system_message = create_system_message(tools_exist=bool(tools_definition))
-    harmony_developer_message = create_developer_message(instructions, tools_definition)
-
-    # The conversation history now starts with these two Harmony-formatted messages.
-    conversation_history = [
-        {"role": "system", "content": harmony_system_message},
-        # Per Harmony docs, the developer message contains the main instructions and tool definitions.
-        {"role": "developer", "content": harmony_developer_message},
-    ]
-    
-    console.print(Panel("GPT-OSS API CLI (Harmony Mode)", style="bold green", expand=False))
-
     # --- Main Conversation Loop ---
     while True:
         try:
@@ -259,13 +199,6 @@ Cache browsing:
                         
                         args = json.loads(args_str)
                         tool_function = AVAILABLE_TOOLS[function_name]
-                        
-                        if function_name in ["view_cached_output", "get_cache_info", "drop_cache"]:
-                            tool_output = tool_function(cache=TOOL_OUTPUT_CACHE, **args)
-                        else:
-                            tool_output = tool_function(**args)
-                        
-                        model_content = tool_output
 
                         if function_name in ["python", "shell"] and len(tool_output) > MAX_TOOL_OUTPUT_CHARS:
                             cache_id = str(uuid.uuid4())
@@ -297,7 +230,6 @@ Cache browsing:
                             "tool_call_id": tool_call["id"],
                             "role": "tool",
                             "name": function_name,
-                            "content": json.dumps(model_content),  # MUST be a JSON string
                         })
                     except json.JSONDecodeError as e:
                         console.print(Panel(f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}", title="[bold red]Argument Error[/bold red]", border_style="red"))
