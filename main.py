@@ -2,6 +2,7 @@
 
 import json
 import requests
+import platform
 from tools import AVAILABLE_TOOLS
 from rich.console import Console
 from rich.panel import Panel
@@ -57,7 +58,17 @@ def stream_model_response(messages, tools):
 
 
 def main():
-    conversation_history = []
+    # --- System Information ---
+    system = platform.system()
+    if system == "Windows":
+        os_name = "Windows"
+        shell_name = "PowerShell"
+    elif system == "Darwin":
+        os_name = "macOS"
+        shell_name = "bash"
+    else:
+        os_name = "Linux"
+        shell_name = "bash"
     
     tools_definition = [
         {"type": "function", "function": {"name": "read_file", "description": "Reads the content of a file. Can read the entire file or a specific range of lines.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string", "description": "The path to the file to read."}, "start_line": {"type": "integer", "description": "Optional. The 1-based line number to start reading from."}, "end_line": {"type": "integer", "description": "Optional. The 1-based line number to stop reading at (inclusive)."}}, "required": ["file_path"]}}},
@@ -65,6 +76,13 @@ def main():
         {"type": "function", "function": {"name": "file_patch", "description": "Applies a patch to a file to add, remove, or modify its content using a diff-like format. This is useful for making specific changes to a file without rewriting the entire file.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string", "description": "The path to the file to patch."}, "patch": {"type": "string", "description": "The patch content. Each line should start with a `+` for additions, `-` for removals, or a space for context. For example, to replace the line 'old_line' with 'new_line', the patch would be '-old_line\\n+new_line'."}}, "required": ["file_path", "patch"]}}}
     ]
 
+    # --- Conversation History ---
+    conversation_history = [
+        {
+            "role": "system",
+            "content": f"You are running in a {os_name} environment. The available shell is {shell_name}."
+        }
+    ]
     console.print(Panel("GPT-OSS API CLI (Stable UI)", style="bold green", expand=False))
 
     # --- Main Conversation Loop ---
