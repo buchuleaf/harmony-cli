@@ -5,6 +5,8 @@ import requests
 import platform
 import uuid
 from tools import AVAILABLE_TOOLS, _truncate_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH
+# Import the new Harmony formatting functions
+from harmony import create_system_message, create_developer_message
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -55,7 +57,7 @@ def main():
     if system == "Windows":
         os_name = "Windows"
         shell_name = "PowerShell"
-        shell_examples = "e.g., `Get-ChildItem` to list files, `Select-String -Path path/to/file.txt -Pattern 'hello'` to search text."
+        shell_examples = "e.g., `Get-ChildItem` to list files, `Select-String -Path path\\to\\file.txt -Pattern 'hello'` to search text."
     elif system == "Darwin":
         os_name = "macOS"
         shell_name = "bash"
@@ -66,12 +68,13 @@ def main():
         shell_examples = "e.g., `ls -l` to list files, `grep 'hello' path/to/file.txt` to search text."
     
     # --- Tool Definitions for the Model ---
+    # This remains as JSON because it's passed directly to the OpenAI-compatible API.
+    # Our harmony.py library will convert this into the text format for the developer message.
     tools_definition = [
         {
-            "type": "function",
-            "function": {
+            "type": "function", "function": {
                 "name": "python",
-                "description": "Executes Python code to perform tasks like file I/O, data manipulation, and complex logic. This is the primary tool for most operations.",
+                "description": "Executes Python code for file I/O, data manipulation, and logic. NOTE: If the output is very large, it will be cached and a cache_id will be returned.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -82,10 +85,9 @@ def main():
             }
         },
         {
-            "type": "function",
-            "function": {
+            "type": "function", "function": {
                 "name": "shell",
-                "description": f"Executes a {shell_name} command as a fallback for tasks impossible in Python, like running external programs (`git`, `curl`), or managing system processes. {shell_examples}",
+                "description": f"Executes a {shell_name} command for tasks like running external programs. NOTE: If the output is very large, it will be cached and a cache_id will be returned. {shell_examples}",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -96,16 +98,49 @@ def main():
             }
         },
         {
-            "type": "function",
-            "function": {
+            "type": "function", "function": {
                 "name": "view_cached_output",
-                "description": "Retrieves and displays a specific portion (a 'page') of a large tool output that was previously cached. Use this to browse or search through large results from `python` or `shell` commands.",
+                "description": "Retrieve a portion of large, cached output from a previous `python` or `shell` call. Choose exactly one mode: line mode OR char mode.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "cache_id": {"type": "string", "description": "The unique ID of the cached output to view."},
-                        "start_line": {"type": "integer", "description": "The starting line number to retrieve (0-indexed). Defaults to 0."},
-                        "line_count": {"type": "integer", "description": "The number of lines to retrieve. Defaults to 100."}
+                        "cache_id":   {"type": "string",  "description": "Unique ID of the cached output."},
+
+                        # Line-mode params
+                        "start_line":   {"type": "integer", "description": "Start line (0-indexed). Use with line_count only."},
+                        "line_count":   {"type": "integer", "description": "Number of lines to retrieve (>0)."},
+                        "before_lines": {"type": "integer", "description": "Optional extra context lines to include BEFORE the window (>=0)."},
+                        "after_lines":  {"type": "integer", "description": "Optional extra context lines to include AFTER the window (>=0)."},
+
+                        # Char-mode params
+                        "start_char": {"type": "integer", "description": "Start character offset (0-indexed). Use with char_count only."},
+                        "char_count": {"type": "integer", "description": "Number of characters to retrieve (>0)."}
+                    },
+                    "required": ["cache_id"]
+                }
+            }
+        },
+        {
+            "type": "function", "function": {
+                "name": "get_cache_info",
+                "description": "Inspect a cached output: returns total lines, total chars, and a short preview of the first 10 lines.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
+                    },
+                    "required": ["cache_id"]
+                }
+            }
+        },
+        {
+            "type": "function", "function": {
+                "name": "drop_cache",
+                "description": "Delete a cached output to free memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
                     },
                     "required": ["cache_id"]
                 }
@@ -113,32 +148,40 @@ def main():
         }
     ]
 
-    # --- System Prompt and Conversation History ---
-    # --- CRITICAL FIX: OS-AWARE SYSTEM PROMPT ---
-    if os_name == "Windows":
-        system_prompt = f"""You are a terminal assistant in a {os_name} environment with a {shell_name} shell. You have three tools: `python`, `shell`, and `view_cached_output`.
-
-FILE PATH RULES:
-1. For the `python` tool, ALWAYS use forward slashes (`/`) for file paths, like `path/to/file.txt`.
-2. For the `shell` tool, you MUST use backslashes (`\\`) for file paths, like `path\\to\\file.exe`. This is critical for Windows commands.
-
-LARGE OUTPUT WORKFLOW:
-- If a command's output is too large, it will be cached and you will receive a `cache_id`.
-- You MUST use the `view_cached_output` tool with the `cache_id` to inspect the output in chunks."""
-    else: # For Linux and macOS
-        system_prompt = f"""You are a terminal assistant in a {os_name} environment with a {shell_name} shell. You have three tools: `python`, `shell`, and `view_cached_output`.
-
-FILE PATH RULE:
-- For ALL tools (`python` and `shell`), you MUST use forward slashes (`/`) for file paths, like `path/to/file.txt`.
-
-LARGE OUTPUT WORKFLOW:
-- If a command's output is too large, it will be cached and you will receive a `cache_id`.
-- You MUST use the `view_cached_output` tool with the `cache_id` to inspect the output in chunks."""
-
-
-    conversation_history = [{"role": "system", "content": system_prompt}]
+    # --- HARMONY-COMPLIANT PROMPT CONSTRUCTION ---
+    # The Harmony format splits the system prompt into two distinct roles: 'system' and 'developer'.
     
-    console.print(Panel("GPT-OSS API CLI", style="bold green", expand=False))
+    # Define the core instructions for the developer message.
+    if os_name == "Windows":
+        instructions = f"""You are a terminal assistant in a {os_name} environment.
+For the `python` tool, ALWAYS use forward slashes (`/`) for file paths.
+For the `shell` tool, YOU MUST use backslashes (`\\`) for file paths.
+
+Cache browsing:
+- Prefer line mode for logs/code; char mode for precise byte/offset slicing.
+- Choose exactly one mode per call: (start_line, line_count[, before_lines, after_lines]) OR (start_char, char_count).
+"""
+    else:  # Linux and macOS
+        instructions = f"""You are a terminal assistant in a {os_name} environment.
+For ALL tools (`python` and `shell`), YOU MUST use forward slashes (`/`) for file paths.
+
+Cache browsing:
+- Prefer line mode for logs/code; char mode for precise byte/offset slicing.
+- Choose exactly one mode per call: (start_line, line_count[, before_lines, after_lines]) OR (start_char, char_count).
+"""
+
+    # Use the new helper functions to create the initial messages.
+    harmony_system_message = create_system_message(tools_exist=bool(tools_definition))
+    harmony_developer_message = create_developer_message(instructions, tools_definition)
+
+    # The conversation history now starts with these two Harmony-formatted messages.
+    conversation_history = [
+        {"role": "system", "content": harmony_system_message},
+        # Per Harmony docs, the developer message contains the main instructions and tool definitions.
+        {"role": "developer", "content": harmony_developer_message},
+    ]
+    
+    console.print(Panel("GPT-OSS API CLI (Harmony Mode)", style="bold green", expand=False))
 
     # --- Main Conversation Loop ---
     while True:
@@ -158,8 +201,10 @@ LARGE OUTPUT WORKFLOW:
 
             console.print("\n[bold yellow]Assistant:[/bold yellow]", end=" ")
             
+            # The API call uses the full history, which now includes our Harmony messages.
             for chunk in stream_model_response(conversation_history, tools_definition):
-                if not chunk.get("choices"): continue
+                if not chunk.get("choices"):
+                    continue
                 delta = chunk["choices"][0].get("delta", {})
 
                 if "content" in delta and delta["content"]:
@@ -176,10 +221,13 @@ LARGE OUTPUT WORKFLOW:
                         if index not in tool_print_state:
                             tool_print_state[index] = {"name_printed": False}
 
-                        if "id" in tool_call_chunk: tool_calls_in_progress[index]["id"] = tool_call_chunk["id"]
+                        if "id" in tool_call_chunk:
+                            tool_calls_in_progress[index]["id"] = tool_call_chunk["id"]
                         if "function" in tool_call_chunk:
-                            if "name" in tool_call_chunk["function"]: tool_calls_in_progress[index]["function"]["name"] = tool_call_chunk["function"]["name"]
-                            if "arguments" in tool_call_chunk["function"]: tool_calls_in_progress[index]["function"]["arguments"] += tool_call_chunk["function"]["arguments"]
+                            if "name" in tool_call_chunk["function"]:
+                                tool_calls_in_progress[index]["function"]["name"] = tool_call_chunk["function"]["name"]
+                            if "arguments" in tool_call_chunk["function"]:
+                                tool_calls_in_progress[index]["function"]["arguments"] += tool_call_chunk["function"]["arguments"]
 
                         if not tool_print_state[index]["name_printed"] and tool_calls_in_progress[index]["function"]["name"]:
                             console.print(f"\n\n[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[index]['function']['name']}(", end="", highlight=False)
@@ -206,32 +254,30 @@ LARGE OUTPUT WORKFLOW:
                     try:
                         args_str = tool_call["function"]["arguments"]
                         if not args_str:
-                             console.print(Panel(f"Error executing tool {function_name}: Arguments are empty.", title="[bold red]Error[/bold red]", border_style="red"))
-                             continue
+                            console.print(Panel(f"Error executing tool {function_name}: Arguments are empty.", title="[bold red]Error[/bold red]", border_style="red"))
+                            continue
                         
                         args = json.loads(args_str)
                         tool_function = AVAILABLE_TOOLS[function_name]
                         
-                        if function_name == "view_cached_output":
+                        if function_name in ["view_cached_output", "get_cache_info", "drop_cache"]:
                             tool_output = tool_function(cache=TOOL_OUTPUT_CACHE, **args)
                         else:
                             tool_output = tool_function(**args)
                         
                         model_content = tool_output
-                        display_output = tool_output
 
                         if function_name in ["python", "shell"] and len(tool_output) > MAX_TOOL_OUTPUT_CHARS:
                             cache_id = str(uuid.uuid4())
                             TOOL_OUTPUT_CACHE[cache_id] = tool_output
                             
-                            lines = tool_output.splitlines()
-                            total_lines = len(lines)
+                            total_lines = len(tool_output.splitlines())
                             
                             model_content = (
                                 f"## Command Successful, Output Too Large\n"
                                 f"The full output is {total_lines} lines long and has been cached.\n"
                                 f"Cache ID: '{cache_id}'\n"
-                                f"Instruct the user that the output is large and use the `view_cached_output` tool with this ID to inspect it."
+                                f"You MUST now use the `view_cached_output` tool with this ID to inspect the output."
                             )
                             
                             display_output = (
@@ -240,18 +286,18 @@ LARGE OUTPUT WORKFLOW:
                                 f"--- Start of Output ---\n" +
                                 _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
                             )
-
-                        if display_output is tool_output:
-                             display_output = _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
+                        else:
+                            display_output = _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
 
                         markdown_output = Markdown(display_output)
                         console.print(Panel(markdown_output, title=f"[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
-
+                        
+                        # The content of a tool message must be a JSON-encoded string.
                         conversation_history.append({
                             "tool_call_id": tool_call["id"],
                             "role": "tool",
                             "name": function_name,
-                            "content": model_content,
+                            "content": json.dumps(model_content),  # MUST be a JSON string
                         })
                     except json.JSONDecodeError as e:
                         console.print(Panel(f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}", title="[bold red]Argument Error[/bold red]", border_style="red"))
