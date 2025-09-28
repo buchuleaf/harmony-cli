@@ -14,7 +14,7 @@ from typing import Dict, Callable, Optional, List, Tuple
 MAX_TOOL_OUTPUT_LINES = 25          # per-stream truncation when formatting small results
 MAX_LINE_LENGTH = 150
 MODEL_MAX_CHARS = 20000             # soft cap for model-visible content; beyond this we auto-truncate
-DISPLAY_MAX_LINES = 10              # hard cap for on-screen display (user)
+DISPLAY_MAX_LINES = 50              # hard cap for on-screen display (user)
 MAX_DIFF_LINES_PER_FILE = 300       # limit in diff previews to avoid explosion
 
 # --- Markdown / Highlighting helpers ---
