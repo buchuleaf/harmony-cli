@@ -1,21 +1,19 @@
 import json
-import uuid
 import platform
 import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
 
-# Local imports from your other files
 from harmony import create_system_message, create_developer_message
-from tools import ToolExecutor, MAX_TOOL_OUTPUT_CHARS, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH, _truncate_output
+from tools import ToolExecutor
 
 # --- Constants and Global Setup ---
 API_URL = "http://localhost:8080/v1/chat/completions"
 
 def stream_model_response(messages, tools):
     """
-    Sends the conversation to the API and yields each chunk of the streaming response.
+    Send the conversation to the API and yield each streaming chunk (SSE).
     """
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -29,49 +27,46 @@ def stream_model_response(messages, tools):
         with requests.post(API_URL, headers=headers, data=json.dumps(payload), stream=True) as response:
             response.raise_for_status()
             for line in response.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    if decoded_line.startswith('data: '):
-                        json_str = decoded_line[6:]
-                        if json_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(json_str)
-                            yield chunk
-                        except json.JSONDecodeError:
-                            # Use a direct print here as console might not be in scope
-                            print(f"\n[Error decoding JSON chunk: {json_str}]")
+                if not line:
+                    continue
+                decoded = line.decode("utf-8")
+                if not decoded.startswith("data: "):
+                    continue
+                body = decoded[6:]
+                if body == "[DONE]":
+                    break
+                try:
+                    yield json.loads(body)
+                except json.JSONDecodeError:
+                    print(f"\n[Bad JSON chunk ignored] {body}")
     except requests.exceptions.RequestException as e:
         print(f"\n[Error connecting to the model API: {e}]")
 
 
 def main():
-    # --- Create a Rich Console instance ---
     console = Console()
-    
-    # --- Initialize conversation state ---
     conversation_history = []
-    tool_executor = ToolExecutor() # Manages tools and their cache
+    tool_executor = ToolExecutor()
 
-    # --- OS-Specific Tool Configuration ---
     if platform.system() == "Windows":
         shell_name = "Command Prompt"
-        shell_examples = "Example: `dir` to list files."
+        shell_example = "Example: `dir`"
     else:
         shell_name = "bash"
-        shell_examples = "Example: `ls -l` to list files."
+        shell_example = "Example: `ls -l`"
 
-    # --- Tool Definitions for the Model ---
+    # ---- Exactly three tools, concise & explicit schemas ----
     tools_definition = [
         {
             "type": "function",
             "function": {
                 "name": "python",
-                "description": "Executes Python code for file I/O, data manipulation, and logic. NOTE: If the output is very large, it will be cached and a cache_id will be returned.",
+                "description": "Execute Python code. Large outputs are cached automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "code": {"type": "string", "description": "The Python code to execute."}
+                        "code":    {"type": "string",  "description": "Python source to run."},
+                        "timeout": {"type": "integer", "description": "Seconds before kill.", "default": 30}
                     },
                     "required": ["code"]
                 }
@@ -81,11 +76,12 @@ def main():
             "type": "function",
             "function": {
                 "name": "shell",
-                "description": f"Executes a {shell_name} command for tasks like running external programs. NOTE: If the output is very large, it will be cached and a cache_id will be returned. {shell_examples}",
+                "description": f"Execute a {shell_name} command. Large outputs are cached automatically. {shell_example}",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": {"type": "string", "description": "The shell command to execute."}
+                        "command": {"type": "string",  "description": "Command to run."},
+                        "timeout": {"type": "integer", "description": "Seconds before kill.", "default": 30}
                     },
                     "required": ["command"]
                 }
@@ -94,185 +90,139 @@ def main():
         {
             "type": "function",
             "function": {
-                "name": "view_cached_output",
-                "description": "Simple cache viewer: pick a mode and a window. Use mode='info' to inspect size & preview.",
+                "name": "cache",
+                "description": "View, inspect, or drop cached outputs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."},
-                        "mode": {"type": "string", "description": "View mode.", "enum": ["lines", "chars", "info"], "default": "lines"},
-                        "start": {"type": "integer", "description": "Start line/char (0-indexed). Defaults to 0."},
-                        "count": {"type": "integer", "description": "How many lines/chars to return. Defaults: lines=100, chars=5000."},
-                        "context_before": {"type": "integer", "description": "Extra context lines BEFORE the window (lines mode).", "default": 0},
-                        "context_after": {"type": "integer", "description": "Extra context lines AFTER the window (lines mode).", "default": 0},
-                        "page": {"type": "integer", "description": "Lines mode only: page index (0-based). Overrides start/count when used."},
-                        "page_size": {"type": "integer", "description": "Lines mode only: page size. Overrides start/count when used."},
-                        # Legacy params accepted (not required). Kept to avoid breaking older prompts:
-                        "start_line": {"type": "integer", "description": "[Legacy] Start line (0-indexed)."},
-                        "line_count": {"type": "integer", "description": "[Legacy] Number of lines to retrieve (>0)."},
-                        "before_lines": {"type": "integer", "description": "[Legacy] Extra context lines BEFORE (>=0)."},
-                        "after_lines": {"type": "integer", "description": "[Legacy] Extra context lines AFTER (>=0)."},
-                        "start_char": {"type": "integer", "description": "[Legacy] Start char (0-indexed)."},
-                        "char_count": {"type": "integer", "description": "[Legacy] Number of chars to retrieve (>0)."}
+                        "action": {
+                            "type": "string",
+                            "enum": ["view", "info", "drop"],
+                            "description": "Operation to perform."
+                        },
+                        "cache_id": {"type": "string", "description": "Cache entry ID."},
+
+                        # For action='view'
+                        "mode": {
+                            "type": "string",
+                            "enum": ["lines", "chars", "info"],
+                            "description": "How to view cached output.",
+                            "default": "lines"
+                        },
+                        "start": {"type": "integer", "description": "Start index (0-based)."},
+                        "count": {"type": "integer", "description": "Number of lines/chars to return."},
+                        "context_before": {"type": "integer", "description": "Lines mode: extra lines before.", "default": 0},
+                        "context_after":  {"type": "integer", "description": "Lines mode: extra lines after.",  "default": 0},
+                        "page": {"type": "integer", "description": "Lines mode: page index (0-based)."},
+                        "page_size": {"type": "integer", "description": "Lines mode: page size."}
                     },
-                    "required": ["cache_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_cache_info",
-                "description": "(Deprecated) Use view_cached_output with mode='info' instead.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
-                    },
-                    "required": ["cache_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "drop_cache",
-                "description": "Delete a cached output to free memory.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
-                    },
-                    "required": ["cache_id"]
+                    "required": ["action", "cache_id"]
                 }
             }
         }
     ]
 
-    # --- Initial Setup for Harmony Messages ---
     instructions = "You are a helpful assistant that can execute code."
     system_message = create_system_message(tools_exist=True)
     developer_message = create_developer_message(instructions, tools_definition)
-    
-    # The first two messages are always the system and developer messages
+
+    # System + developer go in as user-visible content per Harmony format integration
     conversation_history.append({"role": "system", "content": system_message})
     conversation_history.append({"role": "user", "content": developer_message})
 
-    # --- Main Conversation Loop ---
-    console.print(Panel(f"[bold green]Harmony CLI Initialized[/bold green]\n\n[dim]System and developer messages have been pre-loaded.[/dim]\n[dim]Enter your first prompt or type 'exit' to quit.[/dim]"))
+    console.print(Panel("[bold green]Harmony CLI Initialized[/bold green]\n\n[dim]System and developer messages have been pre-loaded.[/dim]\n[dim]Enter your first prompt or type 'exit' to quit.[/dim]"))
+
     while True:
         try:
             user_input = console.input("\n[bold cyan]You: [/bold cyan]")
-            if user_input.lower() == 'exit':
+            if user_input.lower() == "exit":
                 break
         except (KeyboardInterrupt, EOFError):
             break
-            
+
         conversation_history.append({"role": "user", "content": user_input})
 
-        # --- Loop for tool calls until a final text answer is given ---
+        # Stream assistant, capture tool calls, then execute them, loop until final assistant text
         while True:
             full_response_content = ""
             tool_calls_in_progress = []
             tool_print_state = {}
 
-            console.print("\n[bold yellow]Assistant:[/bold yellow]", end=" ")
-            
+            console.print("\n[bold yellow]Assistant:[/bold yellow] ", end="")
+
             for chunk in stream_model_response(conversation_history, tools_definition):
                 if not chunk.get("choices"):
                     continue
                 delta = chunk["choices"][0].get("delta", {})
 
-                if "content" in delta and delta["content"]:
-                    content_chunk = delta["content"]
-                    full_response_content += content_chunk
-                    console.print(content_chunk, end="", style="white", highlight=False)
-                
+                # Stream text
+                if (txt := delta.get("content")):
+                    full_response_content += txt
+                    console.print(txt, end="", style="white", highlight=False)
+
+                # Stream tool call assembly
                 if "tool_calls" in delta and delta["tool_calls"]:
-                    for tool_call_chunk in delta["tool_calls"]:
-                        index = tool_call_chunk["index"]
-                        
-                        if len(tool_calls_in_progress) <= index:
+                    for tc in delta["tool_calls"]:
+                        idx = tc["index"]
+                        if len(tool_calls_in_progress) <= idx:
                             tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                        if index not in tool_print_state:
-                            tool_print_state[index] = {"name_printed": False}
+                        if idx not in tool_print_state:
+                            tool_print_state[idx] = {"name_printed": False}
 
-                        if "id" in tool_call_chunk:
-                            tool_calls_in_progress[index]["id"] = tool_call_chunk["id"]
-                        if "function" in tool_call_chunk:
-                            if "name" in tool_call_chunk["function"]:
-                                tool_calls_in_progress[index]["function"]["name"] = tool_call_chunk["function"]["name"]
-                            if "arguments" in tool_call_chunk["function"]:
-                                tool_calls_in_progress[index]["function"]["arguments"] += tool_call_chunk["function"]["arguments"]
+                        if "id" in tc:
+                            tool_calls_in_progress[idx]["id"] = tc["id"]
+                        if "function" in tc:
+                            f = tool_calls_in_progress[idx]["function"]
+                            if "name" in tc["function"]:
+                                f["name"] = tc["function"]["name"]
+                            if "arguments" in tc["function"]:
+                                f["arguments"] += tc["function"]["arguments"]
 
-                        if not tool_print_state[index]["name_printed"] and tool_calls_in_progress[index]["function"]["name"]:
-                            console.print(f"\n\n[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[index]['function']['name']}(", end="", highlight=False)
-                            tool_print_state[index]["name_printed"] = True
+                        if not tool_print_state[idx]["name_printed"] and tool_calls_in_progress[idx]["function"]["name"]:
+                            console.print(f"\n\n[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[idx]['function']['name']}(", end="", highlight=False)
+                            tool_print_state[idx]["name_printed"] = True
+                        if "function" in tc and "arguments" in tc["function"]:
+                            console.print(tc["function"]["arguments"], end="", style="blue", highlight=False)
 
-                        if "function" in tool_call_chunk and "arguments" in tool_call_chunk["function"]:
-                            console.print(tool_call_chunk["function"]["arguments"], end="", style="blue", highlight=False)
-
-            for index in sorted(tool_print_state.keys()):
-                if tool_print_state[index]["name_printed"]:
+            for idx in sorted(tool_print_state.keys()):
+                if tool_print_state[idx]["name_printed"]:
                     console.print(")", end="", style="blue")
-            
             console.print()
 
-            assistant_message = {"role": "assistant", "content": full_response_content or None}
+            assistant_msg = {"role": "assistant", "content": full_response_content or None}
             if tool_calls_in_progress:
-                assistant_message["tool_calls"] = tool_calls_in_progress
-            conversation_history.append(assistant_message)
+                assistant_msg["tool_calls"] = tool_calls_in_progress
+            conversation_history.append(assistant_msg)
 
-            if tool_calls_in_progress:
-                console.rule("\n[bold blue]Tool Results[/bold blue]", style="blue")
-                tool_results = []
-                for tool_call in tool_calls_in_progress:
-                    function_name = tool_call["function"]["name"]
-                    tool_call_id = tool_call["id"]
-                    try:
-                        args_str = tool_call["function"]["arguments"]
-                        if not args_str:
-                            error_message = f"Error executing tool {function_name}: Arguments are empty."
-                            console.print(Panel(error_message, title="[bold red]Error[/bold red]", border_style="red"))
-                            tool_results.append({"tool_call_id": tool_call_id, "role": "tool", "name": function_name, "content": error_message})
-                            continue
-                        
-                        args = json.loads(args_str)
-                        
-                        # Execute
-                        tool_output = tool_executor.execute_tool(function_name, **args)
-                        
-                        model_content = tool_output  # model sees the markdown above (or cache instructions)
-                        display_output = tool_output # same for the console
+            if not tool_calls_in_progress:
+                break  # final answer delivered
 
-                        # When python/shell output is huge, tools.py appends the unified, simple cache guidance.
-                        # No extra handling needed here.
+            # Execute tools and feed results
+            console.rule("\n[bold blue]Tool Results[/bold blue]", style="blue")
+            tool_results = []
+            for tc in tool_calls_in_progress:
+                fname = tc["function"]["name"]
+                tcall_id = tc["id"]
+                args_str = tc["function"]["arguments"] or ""
+                try:
+                    args = json.loads(args_str)
+                except json.JSONDecodeError as e:
+                    err = f"Error decoding arguments for {fname}: {e}\nArguments received: {args_str}"
+                    console.print(Panel(err, title="[bold red]Argument Error[/bold red]", border_style="red"))
+                    tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": err})
+                    continue
 
-                        markdown_output = Markdown(display_output)
-                        console.print(Panel(markdown_output, title=f"[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
-                        
-                        tool_results.append({
-                            "tool_call_id": tool_call_id,
-                            "role": "tool",
-                            "name": function_name,
-                            "content": model_content, 
-                        })
+                try:
+                    tool_output = tool_executor.execute_tool(fname, **args)
+                    console.print(Panel(Markdown(tool_output), title=f"[bold green]Tool Result: {fname}[/bold green]", border_style="green", expand=False))
+                    tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": tool_output})
+                except Exception as e:
+                    err = f"Error executing tool {fname}: {e}"
+                    console.print(Panel(err, title="[bold red]Execution Error[/bold red]", border_style="red"))
+                    tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": err})
 
-                    except json.JSONDecodeError as e:
-                        error_msg = f"Error decoding arguments for {function_name}: {e}\nArguments received: {args_str}"
-                        console.print(Panel(error_msg, title="[bold red]Argument Error[/bold red]", border_style="red"))
-                        tool_results.append({"tool_call_id": tool_call_id, "role": "tool", "name": function_name, "content": error_msg})
-                    except Exception as e:
-                        error_msg = f"Error executing tool {function_name}: {e}"
-                        console.print(Panel(error_msg, title="[bold red]Execution Error[/bold red]", border_style="red"))
-                        tool_results.append({"tool_call_id": tool_call_id, "role": "tool", "name": function_name, "content": error_msg})
-                
-                # Append all tool results to the history before the next model call
-                conversation_history.extend(tool_results)
-                continue # Continue the inner loop to get the model's response to the tool results
-
-            # If there were no tool calls, the model has given its final answer, so break the inner loop.
-            break
+            conversation_history.extend(tool_results)
+            # Loop again so the model can react to tool outputs
 
     console.print("\n[bold red]Exiting.[/bold red]")
 
