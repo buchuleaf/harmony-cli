@@ -15,6 +15,8 @@ uv run python main.py
 
 ---
 
+# ⚠️ **Warning**: AI slop below:
+
 # 🤖 GPT-OSS: The Operator’s Console
 
 Your terminal isn’t just a shell — it’s **the gateway**.
