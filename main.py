@@ -55,35 +55,21 @@ def main():
         shell_name = "bash"
         shell_example = "Example: `ls -l`"
 
-    # ---- Exactly three tools, concise & explicit schemas ----
+    # ---- Exactly three tools: run, cache, apply_patch ----
     tools_definition = [
         {
             "type": "function",
             "function": {
-                "name": "python",
-                "description": "Execute Python code. Large outputs are cached automatically.",
+                "name": "run",
+                "description": f"Execute code via Python or {shell_name}. Large outputs are cached automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "code":    {"type": "string",  "description": "Python source to run."},
-                        "timeout": {"type": "integer", "description": "Seconds before kill.", "default": 30}
+                        "kind":   {"type": "string", "enum": ["python", "shell"], "description": "Execution mode."},
+                        "code":   {"type": "string", "description": "Python source or shell command string."},
+                        "timeout":{"type": "integer", "description": "Seconds before kill.", "default": 30}
                     },
-                    "required": ["code"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "shell",
-                "description": f"Execute a {shell_name} command. Large outputs are cached automatically. {shell_example}",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string",  "description": "Command to run."},
-                        "timeout": {"type": "integer", "description": "Seconds before kill.", "default": 30}
-                    },
-                    "required": ["command"]
+                    "required": ["kind", "code"]
                 }
             }
         },
@@ -95,20 +81,11 @@ def main():
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["view", "info", "drop"],
-                            "description": "Operation to perform."
-                        },
+                        "action": {"type": "string", "enum": ["view", "info", "drop"], "description": "Operation to perform."},
                         "cache_id": {"type": "string", "description": "Cache entry ID."},
 
                         # For action='view'
-                        "mode": {
-                            "type": "string",
-                            "enum": ["lines", "chars", "info"],
-                            "description": "How to view cached output.",
-                            "default": "lines"
-                        },
+                        "mode": {"type": "string", "enum": ["lines", "chars", "info"], "description": "How to view cached output.", "default": "lines"},
                         "start": {"type": "integer", "description": "Start index (0-based)."},
                         "count": {"type": "integer", "description": "Number of lines/chars to return."},
                         "context_before": {"type": "integer", "description": "Lines mode: extra lines before.", "default": 0},
@@ -119,14 +96,28 @@ def main():
                     "required": ["action", "cache_id"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Use the `apply_patch` tool to edit files.\nYour patch language is a stripped-down, file-oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high-level envelope:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nWithin that envelope, you get a sequence of file operations.\nYou MUST include a header to specify the action you are taking.\nEach operation starts with one of three headers:\n\n*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).\n*** Delete File: <path> - remove an existing file. Nothing follows.\n*** Update File: <path> - patch an existing file in place (optionally with a rename).\n\nMay be immediately followed by *** Move to: <new path> if you want to rename the file.\nThen one or more “hunks”, each introduced by @@ (optionally followed by a hunk header).\nWithin a hunk each line starts with:\n\nFor instructions on [context_before] and [context_after]:\n- By default, show 3 lines of code immediately above and 3 lines immediately below each change. If a change is within 3 lines of a previous change, do NOT duplicate the first change’s [context_after] lines in the second change’s [context_before] lines.\n- If 3 lines of context is insufficient to uniquely identify the snippet of code within the file, use the @@ operator to indicate the class or function to which the snippet belongs. For instance, we might have:\n@@ class BaseClass\n[3 lines of pre-context]\n- [old_code]\n+ [new_code]\n[3 lines of post-context]\n\n- If a code block is repeated so many times in a class or function such that even a single `@@` statement and 3 lines of context cannot uniquely identify the snippet of code, you can use multiple `@@` statements to jump to the right context. For instance:\n\n@@ class BaseClass\n@@ \t def method():\n[3 lines of pre-context]\n- [old_code]\n+ [new_code]\n[3 lines of post-context]\n\nThe full grammar definition is below:\nPatch := Begin { FileOp } End\nBegin := \"*** Begin Patch\" NEWLINE\nEnd := \"*** End Patch\" NEWLINE\nFileOp := AddFile | DeleteFile | UpdateFile\nAddFile := \"*** Add File: \" path NEWLINE { \"+\" line NEWLINE }\nDeleteFile := \"*** Delete File: \" path NEWLINE\nUpdateFile := \"*** Update File: \" path NEWLINE [ MoveTo ] { Hunk }\nMoveTo := \"*** Move to: \" newPath NEWLINE\nHunk := \"@@\" [ header ] NEWLINE { HunkLine } [ \"*** End of File\" NEWLINE ]\nHunkLine := (\" \" | \"-\" | \"+\") text NEWLINE\n\nA full patch can combine several operations:\n\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n\nIt is important to remember:\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even when creating a new file\n- File references can only be relative, NEVER ABSOLUTE.\n",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {"type": "string", "description": "Patch document to apply."}
+                    },
+                    "required": ["patch"]
+                }
+            }
         }
     ]
 
-    instructions = "You are a helpful assistant that can execute code."
+    instructions = "You are a helpful assistant that can execute code and edit files via the provided tools."
     system_message = create_system_message(tools_exist=True)
     developer_message = create_developer_message(instructions, tools_definition)
 
-    # System + developer go in as user-visible content per Harmony format integration
+    # Per Harmony integration: put system + developer strings as visible content
     conversation_history.append({"role": "system", "content": system_message})
     conversation_history.append({"role": "user", "content": developer_message})
 
@@ -142,7 +133,7 @@ def main():
 
         conversation_history.append({"role": "user", "content": user_input})
 
-        # Stream assistant, capture tool calls, then execute them, loop until final assistant text
+        # Stream assistant; capture tool calls; execute; loop until final assistant text
         while True:
             full_response_content = ""
             tool_calls_in_progress = []

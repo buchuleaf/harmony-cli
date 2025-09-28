@@ -1,7 +1,11 @@
-import subprocess
+import os
 import sys
 import uuid
-from typing import Dict, Callable, Optional
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Dict, Callable, Optional, List
 
 # --- Constants for Truncation & Caching ---
 
@@ -35,7 +39,7 @@ def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
     return "\n".join(processed_lines) + truncation_message
 
 
-def _format_shell_output(
+def _format_exec_output(
     result: subprocess.CompletedProcess,
     language: str,
     apply_truncation: bool = True,
@@ -89,18 +93,30 @@ def _compose_cache_payload(stdout: str, stderr: str, returncode: int) -> str:
         parts.append("[stderr]\n" + stderr)
     return "\n\n".join(parts)
 
+
+def _safe_rel_path(p: str) -> Path:
+    """
+    Enforce relative, safe paths (no absolute paths, no parent traversal).
+    """
+    if os.name == "nt" and (":" in p or p.startswith("\\") or p.startswith("/")):
+        raise ValueError("Absolute paths are not allowed.")
+    if p.startswith("/") or p.startswith("./../") or p.startswith("../") or ".." in Path(p).parts:
+        raise ValueError("Parent traversal or absolute paths are not allowed.")
+    return Path(p).resolve().relative_to(Path.cwd().resolve())
+
+
 # --- Tool Executor Class ---
 
 class ToolExecutor:
     """
-    Manages available tools and a shared output cache.
+    Manages available tools, a shared output cache, and patch application.
     """
     def __init__(self):
         self.cache: Dict[str, str] = {}
         self._available_tools: Dict[str, Callable[..., str]] = {
-            "python": self.python,
-            "shell": self.shell,
-            "cache": self.cache_tool,   # unified cache tool
+            "run": self.run,           # unified python/shell
+            "cache": self.cache_tool,  # view/info/drop cache
+            "apply_patch": self.apply_patch,
         }
 
     def execute_tool(self, tool_name: str, **kwargs) -> str:
@@ -112,45 +128,44 @@ class ToolExecutor:
             return method(**kwargs)
         except TypeError as te:
             return f"## Error\nInvalid arguments for `{tool_name}`: {te}"
-
-    # --- Core Tools ---
-
-    def python(self, code: str, timeout: int = 30) -> str:
-        """
-        Executes a string of Python code and returns the formatted output.
-        If the combined raw output is large, caches the full payload and shows a truncated preview.
-        """
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", code],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                stdin=subprocess.DEVNULL,
-            )
         except Exception as e:
-            return f"## Python Execution FAILED\n```text\nAn unexpected error occurred: {str(e)}\n```"
+            return f"## Error\n{type(e).__name__}: {e}"
 
-        return self._finalize_with_optional_cache(result, language="python")
+    # --- Unified Executor ---
 
-    def shell(self, command: str, timeout: int = 30) -> str:
+    def run(self, kind: str, code: str, timeout: int = 30) -> str:
         """
-        Executes a shell command and returns the formatted output.
-        If the combined raw output is large, caches the full payload and shows a truncated preview.
+        Execute either Python or Shell based on `kind`.
+        kind: "python" | "shell"
         """
+        kind = (kind or "").lower()
+        if kind not in ("python", "shell"):
+            return "## Error\n`kind` must be 'python' or 'shell'."
+
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                stdin=subprocess.DEVNULL,
-            )
+            if kind == "python":
+                result = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    stdin=subprocess.DEVNULL,
+                )
+                return self._finalize_with_optional_cache(result, language="python")
+            else:
+                result = subprocess.run(
+                    code,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    stdin=subprocess.DEVNULL,
+                )
+                return self._finalize_with_optional_cache(result, language="bash")
+        except subprocess.TimeoutExpired as te:
+            return f"## Error\nExecution timed out after {timeout}s.\n```text\n{te}\n```"
         except Exception as e:
-            return f"## Shell Command FAILED\n```text\nAn unexpected error occurred: {str(e)}\n```"
-
-        return self._finalize_with_optional_cache(result, language="bash")
+            return f"## Error\nExecution failed: {e}"
 
     # --- Cache-aware finalization ---
 
@@ -163,7 +178,7 @@ class ToolExecutor:
         stderr = result.stderr or ""
         raw_payload = _compose_cache_payload(stdout, stderr, result.returncode)
 
-        display_md = _format_shell_output(result, language=language, apply_truncation=True)
+        display_md = _format_exec_output(result, language=language, apply_truncation=True)
 
         if len(raw_payload) > MAX_TOOL_OUTPUT_CHARS:
             cache_id = str(uuid.uuid4())
@@ -193,7 +208,6 @@ class ToolExecutor:
             f"### Preview (first 10 lines)\n```text\n{head}\n```"
         )
 
-    # Unified cache tool (no legacy params)
     def cache_tool(
         self,
         *,
@@ -294,3 +308,188 @@ class ToolExecutor:
             )
 
         return "## Error\nInvalid `mode`. Use 'lines', 'chars', or 'info'."
+
+    # --- Apply Patch ---
+
+    def apply_patch(self, patch: str) -> str:
+        """
+        Apply a stripped-down, file-oriented diff format safely.
+
+        See developer tool description for exact grammar and rules.
+        """
+        if not isinstance(patch, str) or not patch.strip():
+            return "## Error\n`patch` must be a non-empty string."
+
+        lines = patch.splitlines()
+        i = 0
+
+        # Validate envelope
+        if i >= len(lines) or lines[i].strip() != "*** Begin Patch":
+            return "## Error\nPatch must start with '*** Begin Patch'."
+        i += 1
+
+        ops_applied: List[str] = []
+
+        def read_until_file_end(idx: int) -> int:
+            # For Update File hunks, optional '*** End of File' terminator allowed per grammar.
+            return idx
+
+        while i < len(lines):
+            line = lines[i].rstrip("\n")
+            if line.strip() == "*** End Patch":
+                break
+
+            # ADD FILE
+            if line.startswith("*** Add File: "):
+                path = line[len("*** Add File: "):].strip()
+                try:
+                    rel = _safe_rel_path(path)
+                except Exception as e:
+                    return f"## Error\nInvalid Add path '{path}': {e}"
+
+                i += 1
+                content_lines = []
+                while i < len(lines):
+                    l = lines[i]
+                    if l.startswith("*** "):  # start of next op or end
+                        break
+                    if not l.startswith("+"):
+                        return f"## Error\nAdd File '{path}' expects lines starting with '+'. Offending line: {l}"
+                    content_lines.append(l[1:])
+                    i += 1
+
+                # Write file (create parent dirs)
+                abs_path = Path.cwd() / rel
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                abs_path.write_text("\n".join(content_lines) + ("\n" if content_lines and not content_lines[-1].endswith("\n") else ""), encoding="utf-8")
+                ops_applied.append(f"Added {rel}")
+                continue
+
+            # DELETE FILE
+            if line.startswith("*** Delete File: "):
+                path = line[len("*** Delete File: "):].strip()
+                try:
+                    rel = _safe_rel_path(path)
+                except Exception as e:
+                    return f"## Error\nInvalid Delete path '{path}': {e}"
+
+                abs_path = Path.cwd() / rel
+                if abs_path.exists():
+                    if abs_path.is_dir():
+                        return f"## Error\nDelete File points to a directory: {rel}"
+                    abs_path.unlink()
+                    ops_applied.append(f"Deleted {rel}")
+                else:
+                    return f"## Error\nCannot delete non-existent file: {rel}"
+                i += 1
+                continue
+
+            # UPDATE FILE
+            if line.startswith("*** Update File: "):
+                path = line[len("*** Update File: "):].strip()
+                try:
+                    rel = _safe_rel_path(path)
+                except Exception as e:
+                    return f"## Error\nInvalid Update path '{path}': {e}"
+
+                abs_path = Path.cwd() / rel
+                if not abs_path.exists() or abs_path.is_dir():
+                    return f"## Error\nUpdate target does not exist or is a directory: {rel}"
+
+                i += 1
+                # Optional Move to
+                move_to: Optional[Path] = None
+                if i < len(lines) and lines[i].startswith("*** Move to: "):
+                    newp = lines[i][len("*** Move to: "):].strip()
+                    try:
+                        move_to = _safe_rel_path(newp)
+                    except Exception as e:
+                        return f"## Error\nInvalid Move to path '{newp}': {e}"
+                    i += 1
+
+                # Collect hunks
+                file_text = abs_path.read_text(encoding="utf-8")
+                file_lines = file_text.splitlines()
+
+                def find_subseq(hay: List[str], needle: List[str]) -> int:
+                    """Return start index of consecutive subsequence 'needle' in 'hay', or -1."""
+                    if not needle:
+                        return 0
+                    for s in range(0, len(hay) - len(needle) + 1):
+                        if hay[s:s+len(needle)] == needle:
+                            return s
+                    return -1
+
+                changed = False
+                while i < len(lines) and lines[i].startswith("@@"):
+                    # Skip @@ header line (optional)
+                    i += 1
+                    before_seq: List[str] = []
+                    after_seq:  List[str] = []
+                    while i < len(lines) and not lines[i].startswith("*** ") and not lines[i].startswith("@@"):
+                        hl = lines[i]
+                        if not hl:
+                            # preserve empty line context
+                            before_seq.append("")
+                            after_seq.append("")
+                            i += 1
+                            continue
+
+                        prefix = hl[0]
+                        content = hl[1:] if len(hl) > 0 else ""
+                        if prefix == " ":
+                            before_seq.append(content)
+                            after_seq.append(content)
+                        elif prefix == "-":
+                            before_seq.append(content)
+                        elif prefix == "+":
+                            after_seq.append(content)
+                        else:
+                            return f"## Error\nInvalid hunk line prefix '{prefix}' in Update for '{rel}'."
+                        i += 1
+
+                    # Apply hunk
+                    start_idx = find_subseq(file_lines, before_seq)
+                    if start_idx == -1:
+                        return (
+                            "## Error\nFailed to locate hunk in target file.\n"
+                            f"File: {rel}\n"
+                            "Tip: Increase unique context in the hunk (use @@ headers and 3 lines of context)."
+                        )
+                    end_idx = start_idx + len(before_seq)
+                    file_lines = file_lines[:start_idx] + after_seq + file_lines[end_idx:]
+                    changed = True
+
+                    # Optional "*** End of File" terminator (ignore if present)
+                    if i < len(lines) and lines[i].strip() == "*** End of File":
+                        i += 1
+
+                if not changed:
+                    return f"## Error\nNo hunks provided for Update File: {rel}"
+
+                # Write back
+                final_text = "\n".join(file_lines)
+                abs_path.write_text(final_text + ("" if final_text.endswith("\n") or final_text == "" else "\n"), encoding="utf-8")
+
+                # Move if requested
+                if move_to:
+                    new_abs = Path.cwd() / move_to
+                    new_abs.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(abs_path), str(new_abs))
+                    ops_applied.append(f"Updated {rel} -> moved to {move_to}")
+                else:
+                    ops_applied.append(f"Updated {rel}")
+                continue
+
+            # Unknown line
+            return f"## Error\nUnrecognized patch directive: {line}"
+
+        if i >= len(lines) or lines[i].strip() != "*** End Patch":
+            return "## Error\nPatch must end with '*** End Patch'."
+
+        if not ops_applied:
+            return "## Error\nPatch contained no operations."
+
+        # Summary
+        bullets = "\n".join(f"- {op}" for op in ops_applied)
+        return f"## Patch Applied\n{bullets}"
