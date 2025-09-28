@@ -1,5 +1,3 @@
-# main.py
-
 import json
 import uuid
 import platform
@@ -65,15 +63,93 @@ def main():
 
     # --- Tool Definitions for the Model ---
     tools_definition = [
-        {"type": "function", "function": {"name": "python", "description": "Executes Python code for file I/O, data manipulation, and logic. NOTE: If the output is very large, it will be cached and a cache_id will be returned.", "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "The Python code to execute."}}, "required": ["code"]}}},
-        {"type": "function", "function": {"name": "shell", "description": f"Executes a {shell_name} command for tasks like running external programs. NOTE: If the output is very large, it will be cached and a cache_id will be returned. {shell_examples}", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute."}}, "required": ["command"]}}},
-        {"type": "function", "function": {"name": "view_cached_output", "description": "Retrieve a portion of large, cached output from a previous `python` or `shell` call. Choose exactly one mode: line mode OR char mode.", "parameters": {"type": "object", "properties": {"cache_id": {"type": "string", "description": "Unique ID of the cached output."}, "start_line": {"type": "integer", "description": "Start line (0-indexed). Use with line_count only."}, "line_count": {"type": "integer", "description": "Number of lines to retrieve (>0)."}, "before_lines": {"type": "integer", "description": "Optional extra context lines to include BEFORE the window (>=0)."}, "after_lines": {"type": "integer", "description": "Optional extra context lines to include AFTER the window (>=0)."}, "start_char": {"type": "integer", "description": "Start character offset (0-indexed). Use with char_count only."}, "char_count": {"type": "integer", "description": "Number of characters to retrieve (>0)."}}, "required": ["cache_id"]}}},
-        {"type": "function", "function": {"name": "get_cache_info", "description": "Inspect a cached output: returns total lines, total chars, and a short preview of the first 10 lines.", "parameters": {"type": "object", "properties": {"cache_id": {"type": "string", "description": "Unique ID of the cached output."}}, "required": ["cache_id"]}}},
-        {"type": "function", "function": {"name": "drop_cache", "description": "Delete a cached output to free memory.", "parameters": {"type": "object", "properties": {"cache_id": {"type": "string", "description": "Unique ID of the cached output."}}, "required": ["cache_id"]}}}
+        {
+            "type": "function",
+            "function": {
+                "name": "python",
+                "description": "Executes Python code for file I/O, data manipulation, and logic. NOTE: If the output is very large, it will be cached and a cache_id will be returned.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "The Python code to execute."}
+                    },
+                    "required": ["code"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": f"Executes a {shell_name} command for tasks like running external programs. NOTE: If the output is very large, it will be cached and a cache_id will be returned. {shell_examples}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The shell command to execute."}
+                    },
+                    "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "view_cached_output",
+                "description": "Simple cache viewer: pick a mode and a window. Use mode='info' to inspect size & preview.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."},
+                        "mode": {"type": "string", "description": "View mode.", "enum": ["lines", "chars", "info"], "default": "lines"},
+                        "start": {"type": "integer", "description": "Start line/char (0-indexed). Defaults to 0."},
+                        "count": {"type": "integer", "description": "How many lines/chars to return. Defaults: lines=100, chars=5000."},
+                        "context_before": {"type": "integer", "description": "Extra context lines BEFORE the window (lines mode).", "default": 0},
+                        "context_after": {"type": "integer", "description": "Extra context lines AFTER the window (lines mode).", "default": 0},
+                        "page": {"type": "integer", "description": "Lines mode only: page index (0-based). Overrides start/count when used."},
+                        "page_size": {"type": "integer", "description": "Lines mode only: page size. Overrides start/count when used."},
+                        # Legacy params accepted (not required). Kept to avoid breaking older prompts:
+                        "start_line": {"type": "integer", "description": "[Legacy] Start line (0-indexed)."},
+                        "line_count": {"type": "integer", "description": "[Legacy] Number of lines to retrieve (>0)."},
+                        "before_lines": {"type": "integer", "description": "[Legacy] Extra context lines BEFORE (>=0)."},
+                        "after_lines": {"type": "integer", "description": "[Legacy] Extra context lines AFTER (>=0)."},
+                        "start_char": {"type": "integer", "description": "[Legacy] Start char (0-indexed)."},
+                        "char_count": {"type": "integer", "description": "[Legacy] Number of chars to retrieve (>0)."}
+                    },
+                    "required": ["cache_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_cache_info",
+                "description": "(Deprecated) Use view_cached_output with mode='info' instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
+                    },
+                    "required": ["cache_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "drop_cache",
+                "description": "Delete a cached output to free memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cache_id": {"type": "string", "description": "Unique ID of the cached output."}
+                    },
+                    "required": ["cache_id"]
+                }
+            }
+        }
     ]
 
     # --- Initial Setup for Harmony Messages ---
-    # This is an example instruction. You can change it.
     instructions = "You are a helpful assistant that can execute code."
     system_message = create_system_message(tools_exist=True)
     developer_message = create_developer_message(instructions, tools_definition)
@@ -81,7 +157,6 @@ def main():
     # The first two messages are always the system and developer messages
     conversation_history.append({"role": "system", "content": system_message})
     conversation_history.append({"role": "user", "content": developer_message})
-
 
     # --- Main Conversation Loop ---
     console.print(Panel(f"[bold green]Harmony CLI Initialized[/bold green]\n\n[dim]System and developer messages have been pre-loaded.[/dim]\n[dim]Enter your first prompt or type 'exit' to quit.[/dim]"))
@@ -164,32 +239,15 @@ def main():
                         
                         args = json.loads(args_str)
                         
-                        # *** THIS IS THE CORRECTED TOOL EXECUTION LOGIC ***
+                        # Execute
                         tool_output = tool_executor.execute_tool(function_name, **args)
                         
-                        model_content = tool_output # Default content for the model
-                        display_output = tool_output # Default content for the user display
+                        model_content = tool_output  # model sees the markdown above (or cache instructions)
+                        display_output = tool_output # same for the console
 
-                        # --- Handle large outputs for python and shell tools ---
-                        if function_name in ["python", "shell"] and len(tool_output) > MAX_TOOL_OUTPUT_CHARS:
-                            cache_id = str(uuid.uuid4())
-                            tool_executor.cache[cache_id] = tool_output
-                            total_lines = len(tool_output.splitlines())
-                            
-                            model_content = (
-                                f"## Command Successful, Output Too Large\n"
-                                f"The full output is {total_lines} lines long and has been cached.\n"
-                                f"Cache ID: '{cache_id}'\n"
-                                f"You MUST now use the `get_cache_info` or `view_cached_output` tool with this ID to inspect the output."
-                            )
-                            
-                            display_output = (
-                                f"Output is too large ({total_lines} lines) and has been cached for the model to browse.\n"
-                                f"Cache ID: {cache_id}\n\n"
-                                f"--- Start of Output ---\n" +
-                                _truncate_output(tool_output, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH)
-                            )
-                        
+                        # When python/shell output is huge, tools.py appends the unified, simple cache guidance.
+                        # No extra handling needed here.
+
                         markdown_output = Markdown(display_output)
                         console.print(Panel(markdown_output, title=f"[bold green]Tool Result: {function_name}[/bold green]", border_style="green", expand=False))
                         
