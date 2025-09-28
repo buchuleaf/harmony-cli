@@ -5,6 +5,7 @@ import json
 import shutil
 import difflib
 import subprocess
+import re
 from pathlib import Path
 from typing import Dict, Callable, Optional, List, Tuple
 
@@ -12,9 +13,7 @@ from typing import Dict, Callable, Optional, List, Tuple
 
 MAX_TOOL_OUTPUT_LINES = 25
 MAX_LINE_LENGTH = 150
-
-# Cache threshold: if the raw payload exceeds this many characters, we switch to pagination
-MAX_TOOL_OUTPUT_CHARS = 5000
+MAX_TOOL_OUTPUT_CHARS = 5000  # Pagination threshold (chars)
 
 # Pagination defaults/limits
 DEFAULT_PAGE_SIZE = 200
@@ -22,6 +21,51 @@ MAX_PAGE_SIZE = 1000
 
 # Max unified-diff lines per file preview (to avoid flooding the console)
 MAX_DIFF_LINES_PER_FILE = 300
+
+# --- Markdown / Highlighting helpers ---
+
+_ALLOWED_LEXERS = {"python", "bash", "diff", "json", "text"}
+
+def _normalize_lexer(language: Optional[str]) -> str:
+    """
+    Use a tiny, consistent set of lexers to keep highlighting stable across outputs.
+    Fallback to 'text' if unknown/empty.
+    """
+    if not language:
+        return "text"
+    lang = language.strip().lower()
+    # common aliases
+    if lang in {"sh", "shell"}:
+        lang = "bash"
+    if lang in {"plaintext", "plain", "txt"}:
+        lang = "text"
+    if lang not in _ALLOWED_LEXERS:
+        return "text"
+    return lang
+
+def _md_codeblock(body: str, language: Optional[str] = "") -> str:
+    """
+    Produce a robust fenced code block that won't break even if `body` contains backticks.
+    Chooses a fence length longer than any backtick run in the body.
+    Ensures a trailing newline and closing fence are always present.
+    Normalizes the language to a small, consistent set.
+    """
+    if body is None:
+        body = ""
+    text = body
+
+    # Find the longest run of backticks in the body (3+ to be safe)
+    max_ticks = 0
+    for m in re.finditer(r"`{3,}", text):
+        max_ticks = max(max_ticks, len(m.group(0)))
+    fence_len = max(3, max_ticks + 1)
+    fence = "`" * fence_len
+    lang = _normalize_lexer(language)
+
+    header = f"{fence}{lang}\n"
+    if not text.endswith("\n"):
+        text = text + "\n"
+    return f"{header}{text}{fence}\n"
 
 # --- Helper Functions ---
 
@@ -46,6 +90,8 @@ def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
 
 
 def _format_exec_output(result: subprocess.CompletedProcess, language: str) -> str:
+    """Format small results with stable, normalized lexers and robust fences."""
+    lang = _normalize_lexer(language)
     stdout = result.stdout if result.stdout is not None else ""
     stderr = result.stderr if result.stderr is not None else ""
 
@@ -63,16 +109,20 @@ def _format_exec_output(result: subprocess.CompletedProcess, language: str) -> s
     sections = [header]
     if ok:
         if stdout_display:
-            sections.append(f"### STDOUT\n```{language}\n{stdout_display}\n```\n")
+            sections.append("### STDOUT\n")
+            sections.append(_md_codeblock(stdout_display, lang))
         if stderr_display:
-            sections.append(f"### STDERR\n```text\n{stderr_display}\n```\n")
+            sections.append("### STDERR\n")
+            sections.append(_md_codeblock(stderr_display, "text"))
         if not stdout_display and not stderr_display:
             sections.append("The command produced no output.\n")
     else:
         if stderr_display:
-            sections.append(f"### STDERR\n```text\n{stderr_display}\n```\n")
+            sections.append("### STDERR\n")
+            sections.append(_md_codeblock(stderr_display, "text"))
         if stdout_display:
-            sections.append(f"### STDOUT\n```{language}\n{stdout_display}\n```\n")
+            sections.append("### STDOUT\n")
+            sections.append(_md_codeblock(stdout_display, lang))
         if not stdout_display and not stderr_display:
             sections.append("The command produced no output.\n")
 
@@ -191,19 +241,20 @@ class ToolExecutor:
                     stdin=subprocess.DEVNULL,
                 )
         except subprocess.TimeoutExpired as te:
-            return f"## Error\nExecution timed out after {timeout}s.\n```text\n{te}\n```"
+            return "## Error\nExecution timed out after {}s.\n".format(timeout) + _md_codeblock(str(te), "text")
         except Exception as e:
-            return f"## Error\nExecution failed: {e}"
+            return "## Error\nExecution failed:\n" + _md_codeblock(str(e), "text")
 
-        # If small, show normal formatted output.
         stdout = result.stdout or ""
         stderr = result.stderr or ""
         raw_payload = _compose_cache_payload(stdout, stderr, result.returncode)
 
+        # Small outputs: render directly with consistent lexers
         if len(raw_payload) <= MAX_TOOL_OUTPUT_CHARS:
-            return _format_exec_output(result, language=("python" if kind == "python" else "bash"))
+            lang = "python" if kind == "python" else "bash"
+            return _format_exec_output(result, language=lang)
 
-        # If large, cache and return PAGE 1 right away, with browsing hints.
+        # Large outputs: cache + return page 1 with hints
         cache_id = str(uuid.uuid4())
         self.cache[cache_id] = raw_payload
 
@@ -212,9 +263,10 @@ class ToolExecutor:
         header = "## Command Successful\n" if result.returncode == 0 else f"## Command FAILED (Exit Code: {result.returncode})\n"
         return (
             header +
-            f"### Output cached (ID: `{cache_id}`)\n"
-            f"{first_page_md}\n"
-            f"\n_Use `cache(action='view', cache_id='{cache_id}', page=1)` for the next page, or `cache(action='info', cache_id='{cache_id}')` for totals._\n"
+            f"### Output cached (ID: `{cache_id}`)\n" +
+            first_page_md +
+            "\n_Use `cache(action='view', cache_id='{cache_id}', page=1)` for the next page, or `cache(action='info', cache_id='{cache_id}')` for totals._\n"
+                .replace("{cache_id}", cache_id)
         )
 
     # --- Cache / Pagination ---
@@ -238,9 +290,7 @@ class ToolExecutor:
         slice_lines = lines[start:end]
         body = "\n".join(slice_lines)
 
-        # 1-based display of page number for users; internal page is 0-based
         display_page = page + 1
-
         nav = []
         if page > 0:
             prevp = page - 1
@@ -252,9 +302,9 @@ class ToolExecutor:
         nav_md = ("\n".join(nav)) if nav else "_(single page)_"
 
         return (
-            f"#### Page {display_page} of {total_pages} (lines {start}–{end - 1} of {max(total_lines - 1, 0)})\n"
-            f"```text\n{body}\n```\n"
-            f"{nav_md}"
+            f"#### Page {display_page} of {total_pages} (lines {start}–{max(end - 1, start)} of {max(total_lines - 1, 0)})\n"
+            + _md_codeblock(body, "text")
+            + f"{nav_md}"
         )
 
     def _cache_info_text(self, cache_id: str) -> str:
@@ -269,8 +319,9 @@ class ToolExecutor:
             f"- total_lines: **{total_lines}**\n"
             f"- total_chars: **{total_chars}**\n"
             f"- total_pages (page_size={DEFAULT_PAGE_SIZE}): **{total_pages}**\n"
-            f"### Preview\n```text\n{head_preview}\n```\n"
+            f"### Preview\n" + _md_codeblock(head_preview, "text") +
             f"_Use `cache(action='view', cache_id='{cache_id}', page=0, page_size={DEFAULT_PAGE_SIZE})` to start browsing._"
+                .replace("{cache_id}", cache_id)
         )
 
     def cache_tool(
@@ -375,11 +426,12 @@ class ToolExecutor:
                 trunc_note = ""
                 if len(content_lines) > 30:
                     trunc_note = f"\n... (initial content truncated, {len(content_lines) - 30} more lines hidden) ..."
-                results_md.append(
+                block = (
                     f"### Added: `{rel}`\n"
                     f"- Lines added: **{added_count}**\n"
-                    f"```diff\n{preview}{trunc_note}\n```"
+                    + _md_codeblock(preview + trunc_note, "diff")
                 )
+                results_md.append(block)
                 continue
 
             # DELETE FILE
@@ -509,14 +561,12 @@ class ToolExecutor:
                 net = added - removed
                 summary_ops.append(f"Updated {rel}{moved_to_text} (+{added}/-{removed}, net {net:+d})")
 
-                block = [
-                    f"### Updated: `{rel}`{moved_to_text}",
-                    f"- Lines added: **{added}**, removed: **{removed}**, net: **{net:+d}**",
-                    "```diff",
-                    diff_text if diff_text.strip() else "(no visible diff; whitespace-only change or metadata)",
-                    "```",
-                ]
-                results_md.append("\n".join(block))
+                block = (
+                    f"### Updated: `{rel}`{moved_to_text}\n"
+                    f"- Lines added: **{added}**, removed: **{removed}**, net: **{net:+d}**\n"
+                    + _md_codeblock(diff_text if diff_text.strip() else "(no visible diff; whitespace-only change or metadata)", "diff")
+                )
+                results_md.append(block)
                 continue
 
             # Unknown line
