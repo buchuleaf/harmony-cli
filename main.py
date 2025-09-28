@@ -18,22 +18,16 @@ API_URL = "http://localhost:8080/v1/chat/completions"
 TRANSCRIPTS_DIR = Path("./transcripts")
 
 def approx_tokens_from_text(text: str) -> int:
-    """Ultra-fast token approximation (~4 chars/token)."""
     if not text:
         return 0
     return ceil(len(text) / 4)
 
 def approx_tokens_from_messages_and_tools(messages, tools) -> int:
-    """Estimate prompt tokens by serializing payload (minus stream flag)."""
     payload = {"model": "gpt-oss", "messages": messages, "tools": tools}
     s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return approx_tokens_from_text(s)
 
 def stream_model_response(messages, tools):
-    """
-    Send the conversation to the API and yield each streaming chunk (SSE).
-    NOTE: The caller may interrupt with KeyboardInterrupt (Ctrl+C).
-    """
     headers = {"Content-Type": "application/json"}
     payload = {
         "model": "gpt-oss",
@@ -41,7 +35,6 @@ def stream_model_response(messages, tools):
         "tools": tools,
         "stream": True,
     }
-
     with requests.post(API_URL, headers=headers, data=json.dumps(payload), stream=True) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -62,7 +55,6 @@ def _timestamp() -> str:
 
 def export_chat_json(history, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write compact but readable JSON
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
@@ -87,7 +79,6 @@ def export_chat_md(history, out_path: Path) -> None:
             lines.append("## Assistant\n")
             lines.append(content if content else "_(tool call only)_")
             lines.append("")
-            # If the raw tool_calls are interesting to persist, include them:
             if "tool_calls" in msg and msg["tool_calls"]:
                 lines.append("<details><summary>Tool Calls (raw)</summary>\n\n```json")
                 lines.append(json.dumps(msg["tool_calls"], ensure_ascii=False, indent=2))
@@ -99,7 +90,6 @@ def export_chat_md(history, out_path: Path) -> None:
             lines.append(content)
             lines.append("```\n")
         else:
-            # Any other roles—dump plainly
             lines.append(f"## {role or 'UNKNOWN'}\n")
             lines.append("```text")
             lines.append(content)
@@ -107,10 +97,6 @@ def export_chat_md(history, out_path: Path) -> None:
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 def parse_export_command(cmd: str):
-    """
-    Parse '/export [md|json] [optional/path.ext]'.
-    Returns (format: 'md'|'json', path: Optional[Path]) or raises ValueError.
-    """
     parts = cmd.strip().split()
     if len(parts) < 2:
         raise ValueError("Usage: /export md|json [optional/path]")
@@ -138,13 +124,13 @@ def main():
         shell_name = "bash"
         shell_example = "Example: `ls -l`"
 
-    # ---- Exactly three tools: run, cache, apply_patch ----
+    # ---- Three tools: run, cache (pagination), apply_patch ----
     tools_definition = [
         {
             "type": "function",
             "function": {
                 "name": "run",
-                "description": f"Execute code via Python or {shell_name}. Large outputs are cached automatically.",
+                "description": f"Execute code via Python or {shell_name}. Large outputs are cached and paginated automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -160,21 +146,14 @@ def main():
             "type": "function",
             "function": {
                 "name": "cache",
-                "description": "View, inspect, or drop cached outputs.",
+                "description": "Browse cached tool outputs by page, inspect totals, or drop an entry.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["view", "info", "drop"], "description": "Operation to perform."},
+                        "action":   {"type": "string", "enum": ["view", "info", "drop"], "description": "Operation to perform."},
                         "cache_id": {"type": "string", "description": "Cache entry ID."},
-
-                        # For action='view'
-                        "mode": {"type": "string", "enum": ["lines", "chars", "info"], "description": "How to view cached output.", "default": "lines"},
-                        "start": {"type": "integer", "description": "Start index (0-based)."},
-                        "count": {"type": "integer", "description": "Number of lines/chars to return."},
-                        "context_before": {"type": "integer", "description": "Lines mode: extra lines before.", "default": 0},
-                        "context_after":  {"type": "integer", "description": "Lines mode: extra lines after.",  "default": 0},
-                        "page": {"type": "integer", "description": "Lines mode: page index (0-based)."},
-                        "page_size": {"type": "integer", "description": "Lines mode: page size."}
+                        "page":     {"type": "integer", "description": "0-based page index (default 0).", "default": 0},
+                        "page_size":{"type": "integer", "description": "Lines per page (default 200, max 1000).", "default": 200}
                     },
                     "required": ["action", "cache_id"]
                 }
@@ -202,7 +181,7 @@ def main():
     system_message = create_system_message(tools_exist=True)
     developer_message = create_developer_message(instructions, tools_definition)
 
-    # Per Harmony integration: put system + developer strings as visible content
+    # System + developer
     conversation_history.append({"role": "system", "content": system_message})
     conversation_history.append({"role": "user", "content": developer_message})
 
@@ -260,12 +239,10 @@ def main():
                         continue
                     delta = chunk["choices"][0].get("delta", {})
 
-                    # Stream text
                     if (txt := delta.get("content")):
                         full_response_content += txt
                         console.print(txt, end="", style="white", highlight=False)
 
-                    # Stream tool call assembly
                     if "tool_calls" in delta and delta["tool_calls"]:
                         for tc in delta["tool_calls"]:
                             idx = tc["index"]
@@ -299,7 +276,7 @@ def main():
                     console.print(")", end="", style="blue")
             console.print()
 
-            # Timing + token line
+            # Timing + tokens
             dt = time.perf_counter() - t0
             completion_tok_est = approx_tokens_from_text(full_response_content)
             status = Text.assemble(
@@ -316,10 +293,9 @@ def main():
             )
             console.print(Panel(status, border_style="dim"))
 
-            # Build assistant message for history (keep partial if interrupted)
+            # History
             assistant_msg = {"role": "assistant", "content": (full_response_content or "").rstrip()}
             if was_interrupted:
-                # Tagging the content helps when revisiting the transcript
                 assistant_msg["content"] = (assistant_msg["content"] + "\n\n_[response interrupted by user]_").strip()
 
             if tool_calls_in_progress:
@@ -327,8 +303,7 @@ def main():
             conversation_history.append(assistant_msg)
 
             if not tool_calls_in_progress or was_interrupted:
-                # If interrupted, do NOT execute any collected tool calls—just return control to the user.
-                break  # final (possibly partial) answer delivered
+                break  # return to prompt
 
             # Execute tools and feed results
             console.rule("\n[bold blue]Tool Results[/bold blue]", style="blue")
@@ -363,7 +338,7 @@ def main():
                     tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": err})
 
             conversation_history.extend(tool_results)
-            # Loop again so the model can react to tool outputs
+            # Loop so the model can react to tool outputs
 
     console.print("\n[bold red]Exiting.[/bold red]")
 
