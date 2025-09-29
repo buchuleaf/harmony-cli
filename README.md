@@ -66,10 +66,10 @@ Once inside, the system listens. It executes.
 │ GPT-OSS API CLI (Stable UI)             │
 └─────────────────────────────────────────┘
 
-You: Read the first 5 lines of src/tools.py, then run `python --version`.
+You: Read the first 5 lines of src/harmony_cli/tools.py, then run `python --version`.
 
 Assistant: Accessing...
-Calling Tool: read_file({"file_path": "src/tools.py", "end_line": 5})
+Calling Tool: read_file({"file_path": "src/harmony_cli/tools.py", "end_line": 5})
 Calling Tool: shell({"command": "python --version"})
 ```
 
@@ -93,9 +93,9 @@ Read entire files or just a slice — with **1‑based** line numbers and an aut
 
 **Example**
 
-> You: show me lines 1–40 of `src/cli.py`
+> You: show me lines 1–40 of `src/harmony_cli/cli.py`
 >
-> Assistant: `read_file("src/cli.py", start_line=1, end_line=40)`
+> Assistant: `read_file("src/harmony_cli/cli.py", start_line=1, end_line=40)`
 
 #### `file_patch`
 
@@ -103,12 +103,12 @@ Apply a **diff‑style** patch inline — add (`+`), remove (`-`), or keep conte
 
 **Example**
 
-> You: in `src/cli.py`, change the API port from 8080 → 9000
+> You: in `src/harmony_cli/cli.py`, change the API port from 8080 → 9000
 >
 > Assistant:
 >
 > ```
-> file_patch("src/cli.py", "-API_URL = \"http://localhost:8080/v1/chat/completions\"\n+API_URL = \"http://localhost:9000/v1/chat/completions\"")
+> file_patch("src/harmony_cli/cli.py", "-API_URL = \"http://localhost:8080/v1/chat/completions\"\n+API_URL = \"http://localhost:9000/v1/chat/completions\"")
 > ```
 
 **Patch rules (quick)**
@@ -120,10 +120,10 @@ Apply a **diff‑style** patch inline — add (`+`), remove (`-`), or keep conte
 
 Extend the console with your own tools in three steps.
 
-1. **Forge the Tool** — add a Python function in `src/tools.py`:
+1. **Forge the Tool** — add a Python function in `src/harmony_cli/tools.py`:
 
 ```python
-# src/tools.py
+# src/harmony_cli/tools.py
 def get_system_load() -> str:
     import os
     l1, l5, l15 = os.getloadavg()
@@ -139,7 +139,7 @@ AVAILABLE_TOOLS = {
 }
 ```
 
-3. **Brief the Model** — declare a tool schema in `src/cli.py` `tools_definition`:
+3. **Brief the Model** — declare a tool schema in `src/harmony_cli/cli.py` `tools_definition`:
 
 ```python
 {

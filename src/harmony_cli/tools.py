@@ -5,6 +5,7 @@ import json
 import shutil
 import difflib
 import subprocess
+import shlex
 import re
 from pathlib import Path
 from typing import Dict, Callable, Optional, List, Tuple
@@ -14,8 +15,13 @@ from typing import Dict, Callable, Optional, List, Tuple
 MAX_TOOL_OUTPUT_LINES = 25          # per-stream truncation when formatting small results
 MAX_LINE_LENGTH = 1000
 MODEL_MAX_CHARS = 25000             # soft cap for model-visible content; beyond this we auto-truncate
+MODEL_MAX_OUTPUT_LINES = 120        # default line cap for model-visible stdout/stderr sections
+MODEL_STRICT_OUTPUT_LINES = 40      # tighter cap for known high-noise commands (e.g., recursive ls, recursive grep)
+MODEL_SEARCH_OUTPUT_LINES = 80      # mid-tier cap for broad searches
+MODEL_MAX_LINE_LENGTH = 400         # line width cap for model-visible sections
 DISPLAY_MAX_LINES = 25              # hard cap for on-screen display (user)
 MAX_DIFF_LINES_PER_FILE = 300       # limit in diff previews to avoid explosion
+MAX_PATCH_SECTIONS = 12             # cap the number of per-file sections surfaced in patch reports
 
 # --- Markdown / Highlighting helpers ---
 
@@ -47,6 +53,86 @@ def _md_codeblock(body: str, language: Optional[str] = "") -> str:
     if not text.endswith("\n"):
         text = text + "\n"
     return f"{header}{text}{fence}\n"
+
+
+def _analyze_shell_command(command: str) -> Dict[str, bool]:
+    """Detect shell patterns that tend to overwhelm output buffers."""
+    traits = {
+        "recursive_ls": False,
+        "recursive_search": False,
+        "broad_search": False,
+        "bulk_listing": False,
+        "has_head": False,
+    }
+
+    if not command:
+        return traits
+
+    # Split on common shell separators to isolate pipelines; fall back to naive splits on parsing errors.
+    segments = re.split(r"[;&\n]", command)
+    for segment in segments:
+        if not segment.strip():
+            continue
+        pipeline_parts = segment.split("|")
+        for part in pipeline_parts:
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                tokens = shlex.split(part, posix=True)
+            except ValueError:
+                tokens = part.split()
+
+            if not tokens:
+                continue
+
+            cmd = tokens[0]
+            if cmd == "head":
+                traits["has_head"] = True
+
+            if cmd == "ls":
+                for opt in tokens[1:]:
+                    if opt == "--":
+                        break
+                    if opt.startswith("--"):
+                        if opt == "--recursive" or opt.startswith("--recursive="):
+                            traits["recursive_ls"] = True
+                        continue
+                    if opt.startswith("-") and "R" in opt[1:]:
+                        traits["recursive_ls"] = True
+                if any(opt in {"-a", "-A", "--all"} for opt in tokens[1:]):
+                    traits["bulk_listing"] = True
+                continue
+
+            if cmd in {"find", "tree", "du"}:
+                traits["bulk_listing"] = True
+                if cmd == "du" and not any(opt.startswith("-h") for opt in tokens[1:]):
+                    traits["bulk_listing"] = True
+                continue
+
+            if cmd in {"grep", "egrep", "fgrep"}:
+                traits["broad_search"] = True
+                for opt in tokens[1:]:
+                    if opt == "--":
+                        break
+                    if opt.startswith("--"):
+                        if opt.startswith("--recursive"):
+                            traits["recursive_search"] = True
+                        continue
+                    if opt.startswith("-") and any(flag in opt[1:] for flag in ("r", "R", "d")):
+                        traits["recursive_search"] = True
+                continue
+
+            if cmd in {"rg", "ripgrep"}:
+                traits["broad_search"] = True
+                traits["recursive_search"] = True
+                continue
+
+            if cmd in {"cat", "bat", "less"}:
+                traits["bulk_listing"] = True
+
+    return traits
+
 
 def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
     lines = output.splitlines()
@@ -108,9 +194,9 @@ def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
     hidden_visible = max(total_visible - shown_visible, 0)
 
     trimmed = "\n".join(trimmed_lines)
+    hidden_note = "content line" if hidden_visible == 1 else "content lines"
     return trimmed + (
-        f"\n\n... (display truncated: showing {shown_visible} of {total_visible} content lines, "
-        f"{hidden_visible} hidden) ...\n"
+        f"\n\n... (display truncated: {hidden_visible} {hidden_note} hidden) ...\n"
     )
 
 
@@ -159,6 +245,7 @@ class ToolExecutor:
     """
     Tools:
       - exec(kind="python"|"shell", code, timeout?)
+      - python(code, timeout?)
       - apply_patch(patch)
     Each tool returns a dict:
       { "model": full_or_truncated_for_model, "display": ~10-line console view }
@@ -166,6 +253,7 @@ class ToolExecutor:
     def __init__(self):
         self._available_tools: Dict[str, Callable[..., Dict[str, str]]] = {
             "exec": self.exec,
+            "python": self.python,
             "apply_patch": self.apply_patch,
         }
 
@@ -189,6 +277,10 @@ class ToolExecutor:
         if kind not in ("python", "shell"):
             msg = "## Error\n`kind` must be 'python' or 'shell'."
             return {"model": msg, "display": _display_truncate(msg)}
+
+        command_traits: Dict[str, bool] = {}
+        if kind == "shell" and isinstance(code, str):
+            command_traits = _analyze_shell_command(code)
 
         try:
             if kind == "python":
@@ -217,47 +309,99 @@ class ToolExecutor:
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
-        raw_payload = _compose_cache_payload(stdout, stderr, result.returncode)
 
-        # Build model-oriented markdown (full unless auto-truncated by size)
+        stdout_clean = stdout.rstrip("\n")
+        stderr_clean = stderr.rstrip("\n")
+
+        stdout_for_model = ""
+        stderr_for_model = ""
+
+        notes: List[str] = []
+
+        def _add_note(text: str) -> None:
+            if text and text not in notes:
+                notes.append(text)
+
+        stdout_model_limit = MODEL_MAX_OUTPUT_LINES
+        if command_traits.get("recursive_ls"):
+            stdout_model_limit = min(stdout_model_limit, MODEL_STRICT_OUTPUT_LINES)
+            _add_note(
+                "Recursive directory listings are trimmed to protect the context window. Narrow the path, add a depth flag, or pipe into `head` for a quick peek."
+            )
+        if command_traits.get("bulk_listing"):
+            stdout_model_limit = min(stdout_model_limit, MODEL_STRICT_OUTPUT_LINES)
+            _add_note(
+                "Large file listings are abbreviated. Consider filters (e.g., `find ... -maxdepth`, `du -h`) or piping through `head`."
+            )
+        if command_traits.get("recursive_search"):
+            stdout_model_limit = min(stdout_model_limit, MODEL_STRICT_OUTPUT_LINES)
+            if not command_traits.get("has_head"):
+                _add_note(
+                    "Recursive search results are clipped. Pipe the command into `head` or refine the pattern to keep output manageable."
+                )
+        elif command_traits.get("broad_search"):
+            stdout_model_limit = min(stdout_model_limit, MODEL_SEARCH_OUTPUT_LINES)
+            if not command_traits.get("has_head"):
+                _add_note(
+                    "Search output is trimmed for brevity. Use `| head` or add filters (e.g., `-g`, `--type`) to target relevant matches."
+                )
+
+        if stdout:
+            stdout_for_model = _truncate_output(stdout_clean, stdout_model_limit, MODEL_MAX_LINE_LENGTH)
+        if stderr:
+            stderr_for_model = _truncate_output(stderr_clean, MODEL_MAX_OUTPUT_LINES, MODEL_MAX_LINE_LENGTH)
+
         ok = (result.returncode == 0)
         header = "## Command Successful\n" if ok else f"## Command FAILED (Exit Code: {result.returncode})\n"
 
-        # For smaller results, keep the nice sectioned formatting
-        if len(raw_payload) <= MODEL_MAX_CHARS:
-            model_md_sections = [header]
-            if stdout:
-                model_md_sections.append("### STDOUT\n")
-                model_md_sections.append(_md_codeblock(stdout.rstrip("\n"), "bash" if kind == "shell" else "python"))
-            if stderr:
-                model_md_sections.append("### STDERR\n")
-                model_md_sections.append(_md_codeblock(stderr.rstrip("\n"), "text"))
-            if not stdout and not stderr:
-                model_md_sections.append("The command produced no output.\n")
-            model_content = "".join(model_md_sections)
-        else:
-            # Auto-truncate to protect context window
-            kept = raw_payload[:MODEL_MAX_CHARS]
+        model_md_sections: List[str] = [header]
+        if stdout:
+            model_md_sections.append("### STDOUT\n")
+            model_md_sections.append(_md_codeblock(stdout_for_model, "bash" if kind == "shell" else "python"))
+        if stderr:
+            model_md_sections.append("### STDERR\n")
+            model_md_sections.append(_md_codeblock(stderr_for_model, "text"))
+        if not stdout and not stderr:
+            model_md_sections.append("The command produced no output.\n")
+        for note in notes:
+            model_md_sections.append(f"_{note}_\n")
+
+        model_content = "".join(model_md_sections)
+
+        if len(model_content) > MODEL_MAX_CHARS:
+            truncated_payload = _compose_cache_payload(stdout_for_model, stderr_for_model, result.returncode)
+            kept = truncated_payload[:MODEL_MAX_CHARS]
             model_content = (
                 header
                 + "### OUTPUT (combined)\n"
                 + _md_codeblock(kept, "text")
-                + f"_MODEL NOTE: Result automatically truncated to protect the context window (kept first {MODEL_MAX_CHARS} of {len(raw_payload)} chars). Consider narrowing the command or asking for specific ranges._\n"
+                + f"_MODEL NOTE: Result automatically truncated to protect the context window (kept first {MODEL_MAX_CHARS} of {len(truncated_payload)} chars after safety limits). Consider narrowing the command or asking for specific ranges._\n"
             )
 
-        # Build compact on-screen display (~10 lines)
         display_sections = [header]
         if stdout:
             display_sections.append("### STDOUT\n")
-            display_sections.append(_md_codeblock(_truncate_output(stdout.rstrip("\n"), MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH), "bash" if kind == "shell" else "python"))
+            display_sections.append(
+                _md_codeblock(
+                    _truncate_output(stdout_clean, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH),
+                    "bash" if kind == "shell" else "python",
+                )
+            )
         if stderr:
             display_sections.append("### STDERR\n")
-            display_sections.append(_md_codeblock(_truncate_output(stderr.rstrip("\n"), MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH), "text"))
+            display_sections.append(
+                _md_codeblock(_truncate_output(stderr_clean, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH), "text")
+            )
         if not stdout and not stderr:
             display_sections.append("The command produced no output.\n")
+        for note in notes:
+            display_sections.append(f"_{note}_\n")
         display_content = _display_truncate("".join(display_sections), DISPLAY_MAX_LINES)
 
         return {"model": model_content, "display": display_content}
+
+    def python(self, code: str, timeout: int = 30) -> Dict[str, str]:
+        return self.exec(kind="python", code=code, timeout=timeout)
 
     # --- apply_patch (forgiving; partial hunks; overwrite support) ---
 
@@ -575,7 +719,28 @@ class ToolExecutor:
         summary_list = "\n".join(f"- {op}" for op in summary_ops) if summary_ops else "_(no changes)_"
         warnings_list = ("\n".join(f"- {w}" for w in any_errors)) if any_errors else ""
         warnings_block = f"\n### Warnings\n{warnings_list}\n" if warnings_list else ""
-        detail = "\n\n".join(results_md) if results_md else "_(no details)_"
+        omitted_sections = 0
+        detail_blocks: List[str]
+        if results_md:
+            if len(results_md) > MAX_PATCH_SECTIONS:
+                omitted_sections = len(results_md) - MAX_PATCH_SECTIONS
+                detail_blocks = results_md[:MAX_PATCH_SECTIONS] + [
+                    f"_NOTE: {omitted_sections} additional file sections hidden to protect the context window. Ask for specific files or smaller hunks if you need the rest._"
+                ]
+            else:
+                detail_blocks = results_md
+        else:
+            detail_blocks = ["_(no details)_"]
+
+        if omitted_sections:
+            warnings_block = warnings_block or ""
+            extra_warning = f"- Truncated {omitted_sections} additional file section(s) to keep output manageable."
+            if warnings_block:
+                warnings_block = warnings_block.rstrip("\n") + "\n" + extra_warning + "\n"
+            else:
+                warnings_block = f"\n### Warnings\n{extra_warning}\n"
+
+        detail = "\n\n".join(detail_blocks)
 
         full_md = f"{status_line}{summary_list}{warnings_block}\n\n---\n{detail}"
 

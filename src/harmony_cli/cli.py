@@ -6,10 +6,11 @@ import requests
 from math import ceil
 from pathlib import Path
 from datetime import datetime
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.text import Text
+from rich.live import Live
 
 try:
     from .harmony import create_system_message, create_developer_message
@@ -22,6 +23,7 @@ except ImportError:  # pragma: no cover - support frozen entrypoints
 API_URL = os.environ.get("HARMONY_CLI_API_URL", "http://localhost:8080/v1/chat/completions")
 APP_STATE_DIR = Path(os.environ.get("HARMONY_CLI_HOME", Path.home() / ".harmony-cli"))
 TRANSCRIPTS_DIR = APP_STATE_DIR / "transcripts"
+PROGRAM_ROOT = Path.cwd()
 
 APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -119,6 +121,27 @@ def default_export_path(fmt: str) -> Path:
     fname = f"chat-{_timestamp()}.{fmt}"
     return TRANSCRIPTS_DIR / fname
 
+# ---------- Input Helpers ----------
+
+def prompt_user(console: Console) -> str:
+    """Prompt the user for input; end lines with '\\' to continue typing."""
+    prompt_label = "\n[bold cyan]You:[/bold cyan] "
+    continuation_label = "... "
+    parts: list[str] = []
+
+    while True:
+        try:
+            text = console.input(prompt_label if not parts else continuation_label)
+        except (KeyboardInterrupt, EOFError):
+            raise
+
+        if text.endswith("\\"):
+            parts.append(text[:-1])
+            continue
+
+        parts.append(text)
+        return "\n".join(parts)
+
 # ---------- Main CLI ----------
 
 def main():
@@ -133,13 +156,13 @@ def main():
         shell_name = "bash"
         shell_example = "Example: `ls -l`"
 
-    # ---- Two tools: run, apply_patch ----
+    # ---- Three tools: exec, python, apply_patch ----
     tools_definition = [
         {
             "type": "function",
             "function": {
                 "name": "exec",
-                "description": f"Execute code via Python or {shell_name}. Large outputs are automatically truncated for the model with a note; the on-screen display is kept to ~25 lines.",
+                "description": f"Execute code via Python or {shell_name}. Large outputs are automatically truncated with a note. Prefer the dedicated `python` tool when you only need Python execution.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -154,8 +177,23 @@ def main():
         {
             "type": "function",
             "function": {
+                "name": "python",
+                "description": "Execute Python code with the same output handling as exec(kind='python'). Large outputs are automatically truncated with a note.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code":   {"type": "string", "description": "Python source string."},
+                        "timeout":{"type": "integer", "description": "Seconds before kill.", "default": 30}
+                    },
+                    "required": ["code"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "apply_patch",
-                "description": "Edit files by providing a patch document. Always wrap your changes between `*** Begin Patch` and `*** End Patch`. Use one of:\n- `*** Add File: path`\n- `*** Update File: path`\n- `*** Overwrite File: path` (replace file with provided `+` lines)\n- `*** Delete File: path`\n\nInside updates, prefix new lines with `+`, removed lines with `-`, unchanged context with a leading space. You may include `*** Move to: newpath` after an update header to rename. Fenced code blocks are accepted and stripped. Large results auto-truncate for the model; the on-screen display is ~10 lines.",
+                "description": "Edit files by providing a patch document. Always wrap your changes between `*** Begin Patch` and `*** End Patch`. Use one of:\n- `*** Add File: path`\n- `*** Update File: path`\n- `*** Overwrite File: path` (replace file with provided `+` lines)\n- `*** Delete File: path`\n\nInside updates, prefix new lines with `+`, removed lines with `-`, unchanged context with a leading space. You may include `*** Move to: newpath` after an update header to rename. Fenced code blocks are accepted and stripped. Large results auto-truncate.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -168,7 +206,8 @@ def main():
     ]
 
     instructions = (
-        "You are a helpful assistant that can execute code and edit files via the provided tools."
+        "You are a helpful terminal assistant that can execute code and edit files with the provided tools."
+        f"\n\nRoot directory: {PROGRAM_ROOT}"
     )
     system_message = create_system_message(tools_exist=True)
     developer_message = create_developer_message(instructions, tools_definition)
@@ -178,21 +217,19 @@ def main():
     conversation_history.append({"role": "user", "content": developer_message})
 
     console.print(Panel(
-        "[bold green]Harmony CLI Initialized[/bold green]\n\n"
-        "[dim]System and developer messages have been pre-loaded.[/dim]\n"
+        "[bold green]Harmony CLI[/bold green]\n\n"
         "[dim]Commands: /export md [path], /export json [path][/dim]\n"
-        "[dim]During streaming: press Ctrl+C to interrupt the current response.[/dim]\n"
-        "[dim]Enter your first prompt or type 'exit' to quit.[/dim]"
+        "[dim]Press Ctrl+C to interrupt the current response.[/dim]\n"
     ))
 
     while True:
         try:
-            user_input = console.input("\n[bold cyan]You: [/bold cyan]")
+            user_input = prompt_user(console)
         except (KeyboardInterrupt, EOFError):
             console.print("\n[bold red]Exiting.[/bold red]")
             break
 
-        if user_input.lower() == "exit":
+        if user_input.strip().lower() == "exit":
             console.print("\n[bold red]Exiting.[/bold red]")
             break
 
@@ -223,49 +260,78 @@ def main():
             tool_print_state = {}
             was_interrupted = False
 
-            console.print("\n[bold yellow]Assistant:[/bold yellow] ", end="")
+            console.print("\n[bold yellow]Assistant:[/bold yellow]")
+
+            tool_call_markup = {}
+
+            def render_response():
+                renderables = [Markdown(full_response_content or "")]
+                for idx in sorted(tool_call_markup.keys()):
+                    markup_text = tool_call_markup[idx]
+                    if markup_text:
+                        renderables.append(Text.from_markup(markup_text))
+                if len(renderables) == 1:
+                    return renderables[0]
+                return Group(*renderables)
 
             try:
-                for chunk in stream_model_response(conversation_history, tools_definition):
-                    if not chunk.get("choices"):
-                        continue
-                    delta = chunk["choices"][0].get("delta", {})
+                with Live(render_response(), console=console, refresh_per_second=16) as live:
+                    try:
+                        for chunk in stream_model_response(conversation_history, tools_definition):
+                            if not chunk.get("choices"):
+                                continue
+                            delta = chunk["choices"][0].get("delta", {})
+                            updated = False
 
-                    if (txt := delta.get("content")):
-                        full_response_content += txt
-                        console.print(txt, end="", style="white", highlight=False)
+                            if (txt := delta.get("content")):
+                                full_response_content += txt
+                                updated = True
 
-                    if "tool_calls" in delta and delta["tool_calls"]:
-                        for tc in delta["tool_calls"]:
-                            idx = tc["index"]
-                            if len(tool_calls_in_progress) <= idx:
-                                tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                            if idx not in tool_print_state:
-                                tool_print_state[idx] = {"name_printed": False}
+                            if "tool_calls" in delta and delta["tool_calls"]:
+                                for tc in delta["tool_calls"]:
+                                    idx = tc["index"]
+                                    if len(tool_calls_in_progress) <= idx:
+                                        tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                    if idx not in tool_print_state:
+                                        tool_print_state[idx] = {"name_printed": False}
+                                    if idx not in tool_call_markup:
+                                        tool_call_markup[idx] = ""
 
-                            if "id" in tc:
-                                tool_calls_in_progress[idx]["id"] = tc["id"]
-                            if "function" in tc:
-                                f = tool_calls_in_progress[idx]["function"]
-                                if "name" in tc["function"]:
-                                    f["name"] = tc["function"]["name"]
-                                if "arguments" in tc["function"]:
-                                    f["arguments"] += tc["function"]["arguments"]
+                                    if "id" in tc:
+                                        tool_calls_in_progress[idx]["id"] = tc["id"]
+                                    if "function" in tc:
+                                        f = tool_calls_in_progress[idx]["function"]
+                                        if "name" in tc["function"]:
+                                            f["name"] = tc["function"]["name"]
+                                        if "arguments" in tc["function"]:
+                                            f["arguments"] += tc["function"]["arguments"]
 
-                            if not tool_print_state[idx]["name_printed"] and tool_calls_in_progress[idx]["function"]["name"]:
-                                console.print(f"\n\n[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[idx]['function']['name']}(", end="", highlight=False)
-                                tool_print_state[idx]["name_printed"] = True
-                            if "function" in tc and "arguments" in tc["function"]:
-                                console.print(tc["function"]["arguments"], end="", style="blue", highlight=False)
+                                    if not tool_print_state[idx]["name_printed"] and tool_calls_in_progress[idx]["function"]["name"]:
+                                        prefix = "\n\n" if not tool_call_markup[idx] else "\n"
+                                        tool_call_markup[idx] += f"{prefix}[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[idx]['function']['name']}("
+                                        tool_print_state[idx]["name_printed"] = True
+                                        updated = True
+                                    if "function" in tc and "arguments" in tc["function"]:
+                                        tool_call_markup[idx] += tc["function"]["arguments"]
+                                        updated = True
 
+                            if updated:
+                                live.update(render_response(), refresh=True)
+                    except KeyboardInterrupt:
+                        was_interrupted = True
+                    finally:
+                        pending_update = False
+                        for idx, state in tool_print_state.items():
+                            if state["name_printed"] and idx in tool_call_markup and not tool_call_markup[idx].endswith(")"):
+                                tool_call_markup[idx] += ")"
+                                pending_update = True
+                        if pending_update:
+                            live.update(render_response(), refresh=True)
             except KeyboardInterrupt:
                 was_interrupted = True
-                console.print("\n[bold red]— interrupted —[/bold red]")
 
-            # Close any open parens visually
-            for idx in sorted(tool_print_state.keys()):
-                if tool_print_state[idx]["name_printed"]:
-                    console.print(")", end="", style="blue")
+            if was_interrupted:
+                console.print("\n[bold red]— interrupted —[/bold red]")
             console.print()
 
             # Timing + tokens

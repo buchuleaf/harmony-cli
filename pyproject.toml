@@ -13,6 +13,7 @@ dependencies = [
     "markupsafe==3.0.2",
     "mdurl==0.1.2",
     "pygments==2.19.2",
+    "pyinstaller>=6.16.0",
     "regex==2025.9.18",
     "requests==2.32.5",
     "rich==14.1.0",
@@ -25,7 +26,7 @@ requires = ["setuptools>=69.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-dir]
-"harmony_cli" = "src"
+"" = "src"
 
 [tool.setuptools]
 packages = ["harmony_cli"]
