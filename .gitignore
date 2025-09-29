@@ -9,6 +9,13 @@ wheels/
 # Virtual environments
 .venv
 
-workspace/
+# PyInstaller
+scripts/
+harmony.spec
+
+# Misc
+workspace
 .python-version
 uv.lock
+transcripts/
+.python-version

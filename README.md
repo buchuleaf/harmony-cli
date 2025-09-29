@@ -1,61 +1,61 @@
-# Example Quickstart:
+# Quickstart
 
-> Have `llama-server` from `llama.cpp` running on port 8080.
+> Make sure `llama-server` from `llama.cpp` is running on port `8080`. Override with `HARMONY_CLI_API_URL` if your endpoint lives elsewhere.
+
+## Install locally
 
 ```bash
-# Create the environment
-uv venv
+pip install .
+```
 
-# Install the dependencies
-uv pip install -r requirements.txt
+## Install globally with pipx
 
-# Run the program
-uv run python main.py
+```bash
+pipx install .
+```
+
+## Run without installing
+
+```bash
+python -m harmony_cli
+```
+
+Once installed, launch the console with:
+
+```bash
+harmony
 ```
 
 ---
 
-# ⚠️ **Warning**: AI slop below:
-
-## 🤖 GPT-OSS: The Operator’s Console
-
-Your terminal isn’t just a shell — it’s **the gateway**.
-
-This console is a live, streaming interface into your **local** Large Language Model. No filler, no drag. Just signal. Just command.
-
-Built for operators who bend systems, patch reality, and ship code at the speed of thought.
-
----
-
-*(GIF Placeholder: Neon-lit console streaming character-by-character output; tool calls appear inline, then results fold in below.)*
-
-### ✨ The Construct
-
-- **Hyper‑Stream** — Watch text and code materialize **character‑by‑character** as tokens arrive. Model deltas render live; tool calls surface inline.
-- **System Control** — Speak naturally, act in machine logic. Invoke `shell`, `read_file`, and `file_patch` without leaving the flow.
-- **Visual Clarity** — A `rich` UI with panels and rules that keep long outputs readable.
-- **Signal Integrity** — Clean, flicker‑free streaming; tool results are **paneled** and long outputs are smart‑truncated.
-- **Architect Mode** — Extend with plain Python. Register your function and brief the model; the console does the rest.
-
 ### 🔌 Requirements
 
 - A local model endpoint compatible with `llama.cpp` **chat completions** streaming.
-- Default target: `http://localhost:8080/v1/chat/completions` (configurable in the code).
+- Default target: `http://localhost:8080/v1/chat/completions`; override with `HARMONY_CLI_API_URL`.
+- Transcripts export to `~/.harmony-cli/transcripts` by default; point `HARMONY_CLI_HOME` elsewhere if needed.
 
 > **Tip:** Start `llama-server` from `llama.cpp` on port **8080** before running the console.
 
 ### 🚀 Jacking In
 
 ```bash
-# Create the environment
 uv venv
+source .venv/bin/activate
+pip install .
 
-# Install dependencies
-uv pip install -r requirements.txt
+# Launch the console
+harmony
+```
 
-# Run the console
-uv run python cli.py
-````
+### 📦 Distribution Builds
+
+- Build a wheel + source distribution: `python -m build`.
+- Create a standalone binary (uses PyInstaller):
+  ```bash
+  pip install pyinstaller
+  scripts/build_exe.sh
+  # Result: dist/harmony (single-file executable)
+  ```
 
 ### 💻 Operating
 
@@ -66,10 +66,10 @@ Once inside, the system listens. It executes.
 │ GPT-OSS API CLI (Stable UI)             │
 └─────────────────────────────────────────┘
 
-You: Read the first 5 lines of tools.py, then run `python --version`.
+You: Read the first 5 lines of src/tools.py, then run `python --version`.
 
 Assistant: Accessing...
-Calling Tool: read_file({"file_path": "tools.py", "end_line": 5})
+Calling Tool: read_file({"file_path": "src/tools.py", "end_line": 5})
 Calling Tool: shell({"command": "python --version"})
 ```
 
@@ -93,9 +93,9 @@ Read entire files or just a slice — with **1‑based** line numbers and an aut
 
 **Example**
 
-> You: show me lines 1–40 of `cli.py`
+> You: show me lines 1–40 of `src/cli.py`
 >
-> Assistant: `read_file("cli.py", start_line=1, end_line=40)`
+> Assistant: `read_file("src/cli.py", start_line=1, end_line=40)`
 
 #### `file_patch`
 
@@ -103,12 +103,12 @@ Apply a **diff‑style** patch inline — add (`+`), remove (`-`), or keep conte
 
 **Example**
 
-> You: in `cli.py`, change the API port from 8080 → 9000
+> You: in `src/cli.py`, change the API port from 8080 → 9000
 >
 > Assistant:
 >
 > ```
-> file_patch("cli.py", "-API_URL = \"http://localhost:8080/v1/chat/completions\"\n+API_URL = \"http://localhost:9000/v1/chat/completions\"")
+> file_patch("src/cli.py", "-API_URL = \"http://localhost:8080/v1/chat/completions\"\n+API_URL = \"http://localhost:9000/v1/chat/completions\"")
 > ```
 
 **Patch rules (quick)**
@@ -120,10 +120,10 @@ Apply a **diff‑style** patch inline — add (`+`), remove (`-`), or keep conte
 
 Extend the console with your own tools in three steps.
 
-1. **Forge the Tool** — add a Python function in `tools.py`:
+1. **Forge the Tool** — add a Python function in `src/tools.py`:
 
 ```python
-# tools.py
+# src/tools.py
 def get_system_load() -> str:
     import os
     l1, l5, l15 = os.getloadavg()
@@ -139,7 +139,7 @@ AVAILABLE_TOOLS = {
 }
 ```
 
-3. **Brief the Model** — declare a tool schema in `cli.py` `tools_definition`:
+3. **Brief the Model** — declare a tool schema in `src/cli.py` `tools_definition`:
 
 ```python
 {
