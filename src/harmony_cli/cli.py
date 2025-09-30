@@ -1,16 +1,16 @@
 import json
 import os
+import sys
 import time
 import platform
+import traceback
 import requests
 from math import ceil
 from pathlib import Path
 from datetime import datetime
-from rich.console import Console, Group
+from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
-from rich.text import Text
-from rich.live import Live
 
 try:
     from .harmony import create_system_message, create_developer_message
@@ -23,7 +23,65 @@ except ImportError:  # pragma: no cover - support frozen entrypoints
 API_URL = os.environ.get("HARMONY_CLI_API_URL", "http://localhost:8080/v1/chat/completions")
 APP_STATE_DIR = Path(os.environ.get("HARMONY_CLI_HOME", Path.home() / ".harmony-cli"))
 TRANSCRIPTS_DIR = APP_STATE_DIR / "transcripts"
-PROGRAM_ROOT = Path.cwd()
+
+
+def _detect_program_root() -> Path:
+    """Best-effort detection of the launch directory, even in frozen builds."""
+    env_priority = (
+        "HARMONY_CLI_ROOT",
+        "PYINSTALLER_ORIGINAL_WORKING_DIR",
+        "PWD",
+    )
+
+    for name in env_priority:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        try:
+            candidate = Path(value).expanduser()
+        except Exception:
+            continue
+        if name == "HARMONY_CLI_ROOT" or candidate.exists():
+            return candidate.resolve()
+
+    try:
+        return Path.cwd().resolve()
+    except OSError:
+        return Path(__file__).resolve().parent
+
+
+def _run_python_tool_from_file(path: Path) -> int:
+    try:
+        code = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"Failed to read python tool input: {exc}", file=sys.stderr)
+        return 1
+
+    namespace = {"__name__": "__main__"}
+    try:
+        exec(compile(code, str(path), "exec"), namespace, namespace)
+    except SystemExit as exc:
+        code = exc.code
+        return int(code) if isinstance(code, int) else 1
+    except Exception:  # pragma: no cover - bubbled to stderr for debugging
+        traceback.print_exc()
+        return 1
+    return 0
+
+
+def _maybe_run_python_tool_via_argv(argv: list[str]) -> bool:
+    if len(argv) >= 2 and argv[1] == "--python-tool":
+        if len(argv) < 3:
+            print("--python-tool requires a path argument", file=sys.stderr)
+            exit_code = 2
+        else:
+            path = Path(argv[2])
+            exit_code = _run_python_tool_from_file(path)
+        raise SystemExit(exit_code)
+    return False
+
+
+_maybe_run_python_tool_via_argv(sys.argv)
 
 APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,6 +95,17 @@ def approx_tokens_from_messages_and_tools(messages, tools) -> int:
     payload = {"model": "gpt-oss", "messages": messages, "tools": tools}
     s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return approx_tokens_from_text(s)
+
+
+def _render_markdown(console: Console, content: str) -> None:
+    """Render markdown content for tool outputs with a graceful fallback."""
+    if not content:
+        console.print("(no output)", markup=False)
+        return
+    try:
+        console.print(Markdown(content))
+    except Exception:
+        console.print(content, markup=False)
 
 def stream_model_response(messages, tools):
     headers = {"Content-Type": "application/json"}
@@ -146,6 +215,14 @@ def prompt_user(console: Console) -> str:
 
 def main():
     console = Console()
+
+    launch_root = _detect_program_root()
+    try:
+        os.chdir(launch_root)
+    except OSError:
+        pass
+    program_root = Path.cwd()
+
     conversation_history = []
     tool_executor = ToolExecutor()
 
@@ -207,7 +284,7 @@ def main():
 
     instructions = (
         "You are a helpful terminal assistant that can execute code and edit files with the provided tools."
-        f"\n\nRoot directory: {PROGRAM_ROOT}"
+        f"\n\nRoot directory: {program_root}"
     )
     system_message = create_system_message(tools_exist=True)
     developer_message = create_developer_message(instructions, tools_definition)
@@ -219,15 +296,18 @@ def main():
     console.print(Panel(
         "[bold green]Harmony CLI[/bold green]\n\n"
         "[dim]Commands: /export md [path], /export json [path][/dim]\n"
-        "[dim]Press Ctrl+C to interrupt the current response.[/dim]\n"
+        "[dim]Ctrl+C to interrupt the current response, Ctrl+D to exit.[/dim]\n"
     ))
 
     while True:
         try:
             user_input = prompt_user(console)
-        except (KeyboardInterrupt, EOFError):
+        except EOFError:
             console.print("\n[bold red]Exiting.[/bold red]")
             break
+        except KeyboardInterrupt:
+            console.print("\n[dim]Input interrupted. Press Ctrl+D or type 'exit' to quit.[/dim]")
+            continue
 
         if user_input.strip().lower() == "exit":
             console.print("\n[bold red]Exiting.[/bold red]")
@@ -260,96 +340,68 @@ def main():
             tool_print_state = {}
             was_interrupted = False
 
-            console.print("\n[bold yellow]Assistant:[/bold yellow]")
-
-            tool_call_markup = {}
-
-            def render_response():
-                renderables = [Markdown(full_response_content or "")]
-                for idx in sorted(tool_call_markup.keys()):
-                    markup_text = tool_call_markup[idx]
-                    if markup_text:
-                        renderables.append(Text.from_markup(markup_text))
-                if len(renderables) == 1:
-                    return renderables[0]
-                return Group(*renderables)
+            console.print("\nAssistant:", markup=False)
 
             try:
-                with Live(render_response(), console=console, refresh_per_second=16) as live:
-                    try:
-                        for chunk in stream_model_response(conversation_history, tools_definition):
-                            if not chunk.get("choices"):
-                                continue
-                            delta = chunk["choices"][0].get("delta", {})
-                            updated = False
+                for chunk in stream_model_response(conversation_history, tools_definition):
+                    if not chunk.get("choices"):
+                        continue
+                    delta = chunk["choices"][0].get("delta", {})
 
-                            if (txt := delta.get("content")):
-                                full_response_content += txt
-                                updated = True
+                    if (txt := delta.get("content")):
+                        full_response_content += txt
+                        console.print(txt, end="", markup=False, highlight=False, soft_wrap=False)
 
-                            if "tool_calls" in delta and delta["tool_calls"]:
-                                for tc in delta["tool_calls"]:
-                                    idx = tc["index"]
-                                    if len(tool_calls_in_progress) <= idx:
-                                        tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                                    if idx not in tool_print_state:
-                                        tool_print_state[idx] = {"name_printed": False}
-                                    if idx not in tool_call_markup:
-                                        tool_call_markup[idx] = ""
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        for tc in delta["tool_calls"]:
+                            idx = tc["index"]
+                            while len(tool_calls_in_progress) <= idx:
+                                tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            state = tool_print_state.setdefault(idx, {"started": False, "closed": False})
+                            call_entry = tool_calls_in_progress[idx]
 
-                                    if "id" in tc:
-                                        tool_calls_in_progress[idx]["id"] = tc["id"]
-                                    if "function" in tc:
-                                        f = tool_calls_in_progress[idx]["function"]
-                                        if "name" in tc["function"]:
-                                            f["name"] = tc["function"]["name"]
-                                        if "arguments" in tc["function"]:
-                                            f["arguments"] += tc["function"]["arguments"]
+                            if "id" in tc:
+                                call_entry["id"] = tc["id"]
 
-                                    if not tool_print_state[idx]["name_printed"] and tool_calls_in_progress[idx]["function"]["name"]:
-                                        prefix = "\n\n" if not tool_call_markup[idx] else "\n"
-                                        tool_call_markup[idx] += f"{prefix}[bold blue]Calling Tool:[/bold blue] {tool_calls_in_progress[idx]['function']['name']}("
-                                        tool_print_state[idx]["name_printed"] = True
-                                        updated = True
-                                    if "function" in tc and "arguments" in tc["function"]:
-                                        tool_call_markup[idx] += tc["function"]["arguments"]
-                                        updated = True
+                            if "function" in tc:
+                                func_payload = tc["function"]
+                                call_fn = call_entry["function"]
 
-                            if updated:
-                                live.update(render_response(), refresh=True)
-                    except KeyboardInterrupt:
-                        was_interrupted = True
-                    finally:
-                        pending_update = False
-                        for idx, state in tool_print_state.items():
-                            if state["name_printed"] and idx in tool_call_markup and not tool_call_markup[idx].endswith(")"):
-                                tool_call_markup[idx] += ")"
-                                pending_update = True
-                        if pending_update:
-                            live.update(render_response(), refresh=True)
+                                if "name" in func_payload and func_payload["name"]:
+                                    call_fn["name"] = func_payload["name"]
+
+                                args_part = func_payload.get("arguments", "")
+
+                                if not state["started"] and (call_fn["name"] or args_part):
+                                    display_name = call_fn["name"] or "unknown"
+                                    console.print(f"\nCalling Tool: {display_name}(", end="", markup=False)
+                                    state["started"] = True
+
+                                if args_part:
+                                    call_fn["arguments"] += args_part
+                                    console.print(args_part, end="", markup=False, highlight=False, soft_wrap=False)
+                    console.file.flush()
             except KeyboardInterrupt:
                 was_interrupted = True
 
+            for idx, state in tool_print_state.items():
+                if state["started"] and not state["closed"]:
+                    console.print(")", markup=False)
+                    state["closed"] = True
+
             if was_interrupted:
-                console.print("\n[bold red]— interrupted —[/bold red]")
+                console.print("— interrupted —", markup=False)
+
             console.print()
 
             # Timing + tokens
             dt = time.perf_counter() - t0
             completion_tok_est = approx_tokens_from_text(full_response_content)
-            status = Text.assemble(
-                ("⏱ ", "bold"),
-                (f"{dt:.2f}s", "bold green"),
-                ("  |  in ≈ ", ""),
-                (f"{prompt_tok_est}", "bold cyan"),
-                (" tok", ""),
-                ("  |  out ≈ ", ""),
-                (f"{completion_tok_est}", "bold magenta"),
-                (" tok", ""),
-                ("  |  ", ""),
-                ("(interrupted)" if was_interrupted else "(complete)", "bold red" if was_interrupted else "dim")
+            status = (
+                f"⏱ {dt:.2f}s  |  in ≈ {prompt_tok_est} tok  |  out ≈ {completion_tok_est} tok  |  "
+                f"{'(interrupted)' if was_interrupted else '(complete)'}"
             )
-            console.print(Panel(status, border_style="dim"))
+            console.print(status, markup=False)
 
             # History
             assistant_msg = {"role": "assistant", "content": (full_response_content or "").rstrip()}
@@ -391,10 +443,7 @@ def main():
 
                     header = f"Tool Result: {fname} ({t_tool:.2f}s)"
                     console.print(header, markup=False)
-                    if display_content:
-                        console.print(display_content, markup=False)
-                    else:
-                        console.print("(no output)", markup=False)
+                    _render_markdown(console, display_content)
                     console.print()
 
                     # Push the model content into conversation for the LLM

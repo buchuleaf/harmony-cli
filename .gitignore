@@ -14,8 +14,9 @@ scripts/
 harmony.spec
 
 # Misc
-workspace
+workspace/
 .python-version
 uv.lock
 transcripts/
 .python-version
+docs/

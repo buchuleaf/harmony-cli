@@ -3,6 +3,7 @@ import sys
 import uuid
 import json
 import shutil
+import tempfile
 import difflib
 import subprocess
 import shlex
@@ -134,7 +135,12 @@ def _analyze_shell_command(command: str) -> Dict[str, bool]:
     return traits
 
 
-def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
+def _truncate_output(
+    output: str,
+    max_lines: int,
+    max_line_length: int,
+    trunc_note_template: Optional[str] = None,
+) -> str:
     lines = output.splitlines()
     original_line_count = len(lines)
 
@@ -142,7 +148,8 @@ def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
     if original_line_count > max_lines:
         omitted_lines = original_line_count - max_lines
         lines = lines[:max_lines]
-        truncation_message = f"\n... (output truncated, {omitted_lines} more lines hidden) ..."
+        template = trunc_note_template or "... (output truncated, {omitted_lines} more lines hidden) ..."
+        truncation_message = "\n" + template.format(omitted_lines=omitted_lines)
 
     processed_lines = []
     for line in lines:
@@ -154,11 +161,7 @@ def _truncate_output(output: str, max_lines: int, max_line_length: int) -> str:
     return "\n".join(processed_lines) + truncation_message
 
 def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
-    """
-    Trim any markdown to ~N raw lines for console display, but report *accurate* content-line counts:
-    - Content lines exclude code-fence markers (```), headings (lines starting with '#'), and blank lines.
-    - If truncation cuts inside a code fence, append a closing fence to keep rendering stable.
-    """
+    """Trim markdown for console display and append a simple hidden-line note."""
     lines = md.splitlines()
     if len(lines) <= max_lines:
         # Nothing to trim; still report using content-aware counts if needed.
@@ -174,36 +177,11 @@ def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
         # We were cut mid-fence; close it to avoid broken formatting.
         trimmed_lines.append("```")
 
-    # Content-aware counting
-    def _count_visible(ls: list[str]) -> int:
-        visible = 0
-        in_code = False
-        for L in ls:
-            s = L.strip()
-            if s.startswith("```"):
-                in_code = not in_code
-                continue  # fence markers are not content
-            if not s:
-                continue  # skip blank
-            if not in_code and s.startswith("#"):
-                continue  # headings are not counted as content
-            visible += 1
-        return visible
-
-    total_visible = _count_visible(lines)
-    shown_visible = _count_visible(trimmed_lines)
-    hidden_visible = max(total_visible - shown_visible, 0)
-
     trimmed = "\n".join(trimmed_lines)
 
     hidden_raw = max(len(lines) - shown_raw_count, 0)
-    hidden_raw_note = "line" if hidden_raw == 1 else "lines"
-    hidden_visible_note = "content line" if hidden_visible == 1 else "content lines"
 
-    suffix = f"\n\n... (display truncated: {hidden_raw} {hidden_raw_note} hidden"
-    if hidden_visible != hidden_raw:
-        suffix += f"; {hidden_visible} {hidden_visible_note}"
-    suffix += ") ...\n"
+    suffix = f"\n\n... {hidden_raw} lines hidden ...\n"
     return trimmed + suffix
 
 
@@ -242,7 +220,7 @@ def _diff_and_stats(old_lines: List[str], new_lines: List[str], from_name: str, 
             removed += 1
     if len(diff_lines) > MAX_DIFF_LINES_PER_FILE:
         omitted = len(diff_lines) - MAX_DIFF_LINES_PER_FILE
-        diff_lines = diff_lines[:MAX_DIFF_LINES_PER_FILE] + [f"... (diff truncated, {omitted} more lines hidden) ..."]
+        diff_lines = diff_lines[:MAX_DIFF_LINES_PER_FILE] + [f"... {omitted} lines hidden ..."]
     diff_text = "\n".join(diff_lines)
     return diff_text, added, removed
 
@@ -279,6 +257,46 @@ class ToolExecutor:
 
     # --- run ---
 
+    def _run_python_process(self, code: str, timeout: int) -> subprocess.CompletedProcess:
+        if getattr(sys, "frozen", False):
+            return self._run_python_process_frozen(code, timeout)
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def _run_python_process_frozen(self, code: str, timeout: int) -> subprocess.CompletedProcess:
+        tmp = None
+        tmp_path: Optional[str] = None
+        try:
+            tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8")
+            tmp.write(code)
+            tmp.flush()
+            tmp_path = tmp.name
+        finally:
+            if tmp:
+                tmp.close()
+
+        try:
+            if not tmp_path:
+                raise RuntimeError("Failed to prepare temporary python file")
+            return subprocess.run(
+                [sys.executable, "--python-tool", tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            try:
+                if tmp_path:
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+
     def exec(self, kind: str, code: str, timeout: int = 30) -> Dict[str, str]:
         kind = (kind or "").lower()
         if kind not in ("python", "shell"):
@@ -291,13 +309,7 @@ class ToolExecutor:
 
         try:
             if kind == "python":
-                result = subprocess.run(
-                    [sys.executable, "-c", code],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    stdin=subprocess.DEVNULL,
-                )
+                result = self._run_python_process(code, timeout)
             else:
                 result = subprocess.run(
                     code,
@@ -390,14 +402,27 @@ class ToolExecutor:
             display_sections.append("### STDOUT\n")
             display_sections.append(
                 _md_codeblock(
-                    _truncate_output(stdout_clean, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH),
+                    _truncate_output(
+                        stdout_clean,
+                        MAX_TOOL_OUTPUT_LINES,
+                        MAX_LINE_LENGTH,
+                        trunc_note_template="... {omitted_lines} lines hidden ...",
+                    ),
                     "bash" if kind == "shell" else "python",
                 )
             )
         if stderr:
             display_sections.append("### STDERR\n")
             display_sections.append(
-                _md_codeblock(_truncate_output(stderr_clean, MAX_TOOL_OUTPUT_LINES, MAX_LINE_LENGTH), "text")
+                _md_codeblock(
+                    _truncate_output(
+                        stderr_clean,
+                        MAX_TOOL_OUTPUT_LINES,
+                        MAX_LINE_LENGTH,
+                        trunc_note_template="... {omitted_lines} lines hidden ...",
+                    ),
+                    "text",
+                )
             )
         if not stdout and not stderr:
             display_sections.append("The command produced no output.\n")
@@ -510,7 +535,7 @@ class ToolExecutor:
                 preview = "\n".join("+" + c for c in content_lines[:min(30, len(content_lines))])
                 trunc_note = ""
                 if len(content_lines) > 30:
-                    trunc_note = f"\n... (initial content truncated, {len(content_lines) - 30} more lines hidden) ..."
+                    trunc_note = f"\n... {len(content_lines) - 30} lines hidden ..."
                 block = f"### Added: `{rel}`\n- Lines added: **{added_count}**\n" + _md_codeblock(preview + trunc_note, "diff")
                 results_md.append(block)
                 continue
