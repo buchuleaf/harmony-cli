@@ -20,5 +20,4 @@ uv.lock
 transcripts/
 .python-version
 docs/
-node_modules
 package-lock.json
