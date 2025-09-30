@@ -227,21 +227,30 @@ class ToolExecutor:
     Tools:
       - exec(kind="python"|"shell", code, timeout?)
       - python(code, timeout?)
+      - shell(command, timeout?)
       - apply_patch(patch)
     Each tool returns a dict:
       { "model": full_or_truncated_for_model, "display": ~10-line console view }
     """
     def __init__(self):
         self._available_tools: Dict[str, Callable[..., Dict[str, str]]] = {
-            "exec": self.exec,
+            #"exec": self.exec,
             "python": self.python,
-            "apply_patch": self.apply_patch,
+            "shell": self.shell,  # <-- Add this line
+            #"apply_patch": self.apply_patch,
         }
 
+    def shell(self, command: str, timeout: int = 30) -> Dict[str, str]:
+        # Call the existing exec method with kind="shell"
+        return self.exec(kind="shell", code=command, timeout=timeout)
+    
     def execute_tool(self, tool_name: str, **kwargs) -> Dict[str, str]:
+        # This method will now correctly find the "shell" tool.
         method = self._available_tools.get(tool_name)
         if method is None:
-            return {"model": f"## Error\nTool `{tool_name}` not found.", "display": f"## Error\nTool `{tool_name}` not found."}
+            # Note: I've slightly improved the error message for clarity.
+            msg = f"## Error\nTool `{tool_name}` not found."
+            return {"model": msg, "display": _display_truncate(msg)}
         try:
             return method(**kwargs)
         except TypeError as te:

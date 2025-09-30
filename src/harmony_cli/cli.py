@@ -254,29 +254,13 @@ def main():
         shell_name = "bash"
         shell_example = "Example: `ls -l`"
 
-    # ---- Three tools: exec, python, apply_patch ----
+    # ---- Two tools: python and shell ----
     tools_definition = [
         {
             "type": "function",
             "function": {
-                "name": "exec",
-                "description": f"Execute code via Python or {shell_name}. Large outputs are automatically truncated with a note. Prefer the dedicated `python` tool when you only need Python execution.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "kind":   {"type": "string", "enum": ["python", "shell"], "description": "Execution mode."},
-                        "code":   {"type": "string", "description": "Python source or shell command string."},
-                        "timeout":{"type": "integer", "description": "Seconds before kill.", "default": 30}
-                    },
-                    "required": ["kind", "code"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "python",
-                "description": "Execute Python code with the same output handling as exec(kind='python'). Large outputs are automatically truncated with a note.",
+                "description": "Execute Python code. Large outputs are automatically truncated with a note.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -290,21 +274,23 @@ def main():
         {
             "type": "function",
             "function": {
-                "name": "apply_patch",
-                "description": "Edit files by providing a patch document. Always wrap your changes between `*** Begin Patch` and `*** End Patch`. Use one of:\n- `*** Add File: path`\n- `*** Update File: path`\n- `*** Overwrite File: path` (replace file with provided `+` lines)\n- `*** Delete File: path`\n\nInside updates, prefix new lines with `+`, removed lines with `-`, unchanged context with a leading space. You may include `*** Move to: newpath` after an update header to rename. Fenced code blocks are accepted and stripped. Large results auto-truncate.",
+                "name": "shell",
+                "description": f"Execute shell commands via {shell_name}. Large outputs are automatically truncated with a note. {shell_example}",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "patch": {"type": "string", "description": "The patch text to apply."}
+                        "command": {"type": "string", "description": "Shell command string."},
+                        "timeout": {"type": "integer", "description": "Seconds before kill.", "default": 30}
                     },
-                    "required": ["patch"]
+                    "required": ["command"]
                 }
             }
         }
     ]
 
     instructions = (
-        "You are a helpful terminal assistant that can execute code and edit files with the provided tools."
+        "You are a helpful terminal assistant with access to tools."
+        f"\nTry to primarily use the python tool when using a function tool."
         f"\n\nRoot directory: {program_root}"
     )
     system_message = create_system_message(tools_exist=True)
