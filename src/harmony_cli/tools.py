@@ -17,7 +17,7 @@ MAX_TOOL_OUTPUT_LINES = 25          # per-stream truncation when formatting smal
 MAX_LINE_LENGTH = 1000
 MODEL_MAX_CHARS = 25000             # soft cap for model-visible content; beyond this we auto-truncate
 MODEL_MAX_OUTPUT_LINES = 120        # default line cap for model-visible stdout/stderr sections
-MODEL_STRICT_OUTPUT_LINES = 40      # tighter cap for known high-noise commands (e.g., recursive ls, recursive grep)
+MODEL_STRICT_OUTPUT_LINES = 40      # tighter cap for known high-noise commands (e.g. recursive ls, recursive grep)
 MODEL_SEARCH_OUTPUT_LINES = 80      # mid-tier cap for broad searches
 MODEL_MAX_LINE_LENGTH = 400         # line width cap for model-visible sections
 DISPLAY_MAX_LINES = 25              # hard cap for on-screen display (user)
@@ -55,7 +55,6 @@ def _md_codeblock(body: str, language: Optional[str] = "") -> str:
         text = text + "\n"
     return f"{header}{text}{fence}\n"
 
-
 def _analyze_shell_command(command: str) -> Dict[str, bool]:
     """Detect shell patterns that tend to overwhelm output buffers."""
     traits = {
@@ -65,7 +64,6 @@ def _analyze_shell_command(command: str) -> Dict[str, bool]:
         "bulk_listing": False,
         "has_head": False,
     }
-
     if not command:
         return traits
 
@@ -134,7 +132,6 @@ def _analyze_shell_command(command: str) -> Dict[str, bool]:
 
     return traits
 
-
 def _truncate_output(
     output: str,
     max_lines: int,
@@ -184,7 +181,6 @@ def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
     suffix = f"\n\n... {hidden_raw} lines hidden ...\n"
     return trimmed + suffix
 
-
 def _compose_cache_payload(stdout: str, stderr: str, returncode: int) -> str:
     parts = [f"[exit_code] {returncode}"]
     if stdout:
@@ -220,7 +216,7 @@ def _diff_and_stats(old_lines: List[str], new_lines: List[str], from_name: str, 
             removed += 1
     if len(diff_lines) > MAX_DIFF_LINES_PER_FILE:
         omitted = len(diff_lines) - MAX_DIFF_LINES_PER_FILE
-        diff_lines = diff_lines[:MAX_DIFF_LINES_PER_FILE] + [f"... {omitted} lines hidden ..."]
+        diff_lines = diff_lines[:MAX_DIFF_LINES_PER_FILE] + [f". {omitted} lines hidden ."]
     diff_text = "\n".join(diff_lines)
     return diff_text, added, removed
 
@@ -258,6 +254,7 @@ class ToolExecutor:
     # --- run ---
 
     def _run_python_process(self, code: str, timeout: int) -> subprocess.CompletedProcess:
+        # In frozen bundles, delegate to the app with --python-tool
         if getattr(sys, "frozen", False):
             return self._run_python_process_frozen(code, timeout)
         return subprocess.run(
@@ -267,7 +264,7 @@ class ToolExecutor:
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
-
+    
     def _run_python_process_frozen(self, code: str, timeout: int) -> subprocess.CompletedProcess:
         tmp = None
         tmp_path: Optional[str] = None
@@ -283,8 +280,15 @@ class ToolExecutor:
         try:
             if not tmp_path:
                 raise RuntimeError("Failed to prepare temporary python file")
+            
+            # Debug: print what we're calling
+            import sys
+            cmd = [sys.executable, "--python-tool", tmp_path]
+            # For frozen apps, sys.executable is the executable path
+            # Make sure we're passing args correctly
+            
             return subprocess.run(
-                [sys.executable, "--python-tool", tmp_path],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -332,58 +336,25 @@ class ToolExecutor:
         stdout_clean = stdout.rstrip("\n")
         stderr_clean = stderr.rstrip("\n")
 
-        stdout_for_model = ""
-        stderr_for_model = ""
-
-        notes: List[str] = []
-
-        def _add_note(text: str) -> None:
-            if text and text not in notes:
-                notes.append(text)
-
-        stdout_model_limit = MODEL_MAX_OUTPUT_LINES
-        if command_traits.get("recursive_ls"):
-            stdout_model_limit = min(stdout_model_limit, MODEL_STRICT_OUTPUT_LINES)
-            _add_note(
-                "Recursive directory listings are trimmed to protect the context window. Narrow the path, add a depth flag, or pipe into `head` for a quick peek."
-            )
-        if command_traits.get("bulk_listing"):
-            stdout_model_limit = min(stdout_model_limit, MODEL_STRICT_OUTPUT_LINES)
-            _add_note(
-                "Large file listings are abbreviated. Consider filters (e.g., `find ... -maxdepth`, `du -h`) or piping through `head`."
-            )
-        if command_traits.get("recursive_search"):
-            stdout_model_limit = min(stdout_model_limit, MODEL_STRICT_OUTPUT_LINES)
-            if not command_traits.get("has_head"):
-                _add_note(
-                    "Recursive search results are clipped. Pipe the command into `head` or refine the pattern to keep output manageable."
-                )
-        elif command_traits.get("broad_search"):
-            stdout_model_limit = min(stdout_model_limit, MODEL_SEARCH_OUTPUT_LINES)
-            if not command_traits.get("has_head"):
-                _add_note(
-                    "Search output is trimmed for brevity. Use `| head` or add filters (e.g., `-g`, `--type`) to target relevant matches."
-                )
-
-        if stdout:
-            stdout_for_model = _truncate_output(stdout_clean, stdout_model_limit, MODEL_MAX_LINE_LENGTH)
-        if stderr:
-            stderr_for_model = _truncate_output(stderr_clean, MODEL_MAX_OUTPUT_LINES, MODEL_MAX_LINE_LENGTH)
+        stdout_for_model = _truncate_output(
+            stdout_clean,
+            MODEL_STRICT_OUTPUT_LINES if command_traits.get("recursive_ls") or command_traits.get("recursive_search") else MODEL_MAX_OUTPUT_LINES,
+            MODEL_MAX_LINE_LENGTH,
+        )
+        stderr_for_model = _truncate_output(stderr_clean, MODEL_MAX_OUTPUT_LINES, MODEL_MAX_LINE_LENGTH)
 
         ok = (result.returncode == 0)
         header = "## Command Successful\n" if ok else f"## Command FAILED (Exit Code: {result.returncode})\n"
 
         model_md_sections: List[str] = [header]
-        if stdout:
+        if stdout_for_model:
             model_md_sections.append("### STDOUT\n")
             model_md_sections.append(_md_codeblock(stdout_for_model, "bash" if kind == "shell" else "python"))
-        if stderr:
+        if stderr_for_model:
             model_md_sections.append("### STDERR\n")
             model_md_sections.append(_md_codeblock(stderr_for_model, "text"))
-        if not stdout and not stderr:
+        if not stdout_for_model and not stderr_for_model:
             model_md_sections.append("The command produced no output.\n")
-        for note in notes:
-            model_md_sections.append(f"_{note}_\n")
 
         model_content = "".join(model_md_sections)
 
@@ -406,7 +377,7 @@ class ToolExecutor:
                         stdout_clean,
                         MAX_TOOL_OUTPUT_LINES,
                         MAX_LINE_LENGTH,
-                        trunc_note_template="... {omitted_lines} lines hidden ...",
+                        trunc_note_template=". {omitted_lines} lines hidden .",
                     ),
                     "bash" if kind == "shell" else "python",
                 )
@@ -419,21 +390,105 @@ class ToolExecutor:
                         stderr_clean,
                         MAX_TOOL_OUTPUT_LINES,
                         MAX_LINE_LENGTH,
-                        trunc_note_template="... {omitted_lines} lines hidden ...",
+                        trunc_note_template=". {omitted_lines} lines hidden .",
                     ),
                     "text",
                 )
             )
         if not stdout and not stderr:
             display_sections.append("The command produced no output.\n")
+
+        # Helpful display notes for common noisy commands
+        notes: List[str] = []
+        if command_traits.get("recursive_ls"):
+            notes.append("Recursive directory listings are trimmed to protect the context window. Narrow the path, add a depth flag, or pipe into `head` for a quick peek.")
+        if command_traits.get("bulk_listing"):
+            notes.append("Large file listings are abbreviated. Consider filters (e.g., `find ... -maxdepth`, `du -h`) or piping through `head`.")
+        if command_traits.get("recursive_search") and "has_head" not in command_traits:
+            notes.append("Recursive search results are clipped. Pipe the command into `head` or refine the pattern to keep output manageable.")
+
         for note in notes:
             display_sections.append(f"_{note}_\n")
-        display_content = _display_truncate("".join(display_sections), DISPLAY_MAX_LINES)
 
+        display_content = _display_truncate("".join(display_sections), DISPLAY_MAX_LINES)
         return {"model": model_content, "display": display_content}
 
     def python(self, code: str, timeout: int = 30) -> Dict[str, str]:
-        return self.exec(kind="python", code=code, timeout=timeout)
+        try:
+            result = self._run_python_process(code, timeout)
+        except subprocess.TimeoutExpired as te:
+            msg = "## Error\nExecution timed out after {}s.\n".format(timeout) + _md_codeblock(str(te), "text")
+            return {"model": msg, "display": _display_truncate(msg)}
+        except Exception as e:
+            msg = "## Error\nExecution failed:\n" + _md_codeblock(str(e), "text")
+            return {"model": msg, "display": _display_truncate(msg)}
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
+        stdout_clean = stdout.rstrip("\n")
+        stderr_clean = stderr.rstrip("\n")
+
+        stdout_for_model = _truncate_output(stdout_clean, MODEL_MAX_OUTPUT_LINES, MODEL_MAX_LINE_LENGTH)
+        stderr_for_model = _truncate_output(stderr_clean, MODEL_MAX_OUTPUT_LINES, MODEL_MAX_LINE_LENGTH)
+
+        ok = (result.returncode == 0)
+        header = "## Command Successful\n" if ok else f"## Command FAILED (Exit Code: {result.returncode})\n"
+
+        model_md_sections: List[str] = [header]
+        if stdout_for_model:
+            model_md_sections.append("### STDOUT\n")
+            model_md_sections.append(_md_codeblock(stdout_for_model, "python"))
+        if stderr_for_model:
+            model_md_sections.append("### STDERR\n")
+            model_md_sections.append(_md_codeblock(stderr_for_model, "text"))
+        if not stdout_for_model and not stderr_for_model:
+            model_md_sections.append("The command produced no output.\n")
+
+        model_content = "".join(model_md_sections)
+
+        if len(model_content) > MODEL_MAX_CHARS:
+            truncated_payload = _compose_cache_payload(stdout_for_model, stderr_for_model, result.returncode)
+            kept = truncated_payload[:MODEL_MAX_CHARS]
+            model_content = (
+                header
+                + "### OUTPUT (combined)\n"
+                + _md_codeblock(kept, "text")
+                + f"_MODEL NOTE: Result automatically truncated to protect the context window (kept first {MODEL_MAX_CHARS} of {len(truncated_payload)} chars after safety limits)._\n"
+            )
+
+        display_sections = [header]
+        if stdout:
+            display_sections.append("### STDOUT\n")
+            display_sections.append(
+                _md_codeblock(
+                    _truncate_output(
+                        stdout_clean,
+                        MAX_TOOL_OUTPUT_LINES,
+                        MAX_LINE_LENGTH,
+                        trunc_note_template=". {omitted_lines} lines hidden .",
+                    ),
+                    "python",
+                )
+            )
+        if stderr:
+            display_sections.append("### STDERR\n")
+            display_sections.append(
+                _md_codeblock(
+                    _truncate_output(
+                        stderr_clean,
+                        MAX_TOOL_OUTPUT_LINES,
+                        MAX_LINE_LENGTH,
+                        trunc_note_template=". {omitted_lines} lines hidden .",
+                    ),
+                    "text",
+                )
+            )
+        if not stdout and not stderr:
+            display_sections.append("The command produced no output.\n")
+
+        display_content = _display_truncate("".join(display_sections), DISPLAY_MAX_LINES)
+        return {"model": model_content, "display": display_content}
 
     # --- apply_patch (forgiving; partial hunks; overwrite support) ---
 
@@ -522,21 +577,16 @@ class ToolExecutor:
                     i += 1
 
                 abs_path = Path.cwd() / rel
-                if abs_path.exists() and abs_path.is_dir():
-                    msg = f"## Error\nCannot add file; path is a directory: {rel}"
-                    return {"model": msg, "display": _display_truncate(msg)}
                 if abs_path.exists():
-                    msg = f"## Error\nCannot add file; it already exists: {rel}"
-                    return {"model": msg, "display": _display_truncate(msg)}
-
+                    old_text = abs_path.read_text(encoding="utf-8")
+                    old_lines = old_text.splitlines()
+                else:
+                    old_lines = []
                 _write_file(abs_path, content_lines)
-                added_count = len(content_lines)
-                summary_ops.append(f"Added {rel} (+{added_count})")
-                preview = "\n".join("+" + c for c in content_lines[:min(30, len(content_lines))])
-                trunc_note = ""
-                if len(content_lines) > 30:
-                    trunc_note = f"\n... {len(content_lines) - 30} lines hidden ..."
-                block = f"### Added: `{rel}`\n- Lines added: **{added_count}**\n" + _md_codeblock(preview + trunc_note, "diff")
+                diff_text, added, removed = _diff_and_stats(old_lines, content_lines, from_name="/dev/null", to_name=str(rel))
+                net = added - removed
+                summary_ops.append(f"Added {rel} (+{added}/-{removed}, net {net:+d})")
+                block = f"### Added: `{rel}`\n- Lines added: **{added}**, removed: **{removed}**, net: **{net:+d}**\n" + _md_codeblock(diff_text, "diff")
                 results_md.append(block)
                 continue
 
@@ -548,21 +598,18 @@ class ToolExecutor:
                 except Exception as e:
                     msg = f"## Error\nInvalid Delete path '{raw_path}': {e}"
                     return {"model": msg, "display": _display_truncate(msg)}
-
                 abs_path = Path.cwd() / rel
-                if abs_path.exists():
-                    if abs_path.is_dir():
-                        msg = f"## Error\nDelete File points to a directory: {rel}"
-                        return {"model": msg, "display": _display_truncate(msg)}
-                    old_text = abs_path.read_text(encoding="utf-8")
-                    old_lines = old_text.splitlines()
-                    old_count = len(old_lines)
-                    abs_path.unlink()
-                    summary_ops.append(f"Deleted {rel} (-{old_count})")
-                    results_md.append(f"### Deleted: `{rel}`\n- Previous line count: **{old_count}**\n")
-                else:
-                    msg = f"## Error\nCannot delete non-existent file: {rel}"
+                if not abs_path.exists() or abs_path.is_dir():
+                    msg = f"## Error\nDelete target does not exist or is a directory: {rel}"
                     return {"model": msg, "display": _display_truncate(msg)}
+                old_text = abs_path.read_text(encoding="utf-8")
+                old_lines = old_text.splitlines()
+                abs_path.unlink()
+                diff_text, added, removed = _diff_and_stats(old_lines, [], from_name=str(rel), to_name="/dev/null")
+                net = added - removed
+                summary_ops.append(f"Deleted {rel} (+{added}/-{removed}, net {net:+d})")
+                block = f"### Deleted: `{rel}`\n- Lines added: **{added}**, removed: **{removed}**, net: **{net:+d}**\n" + _md_codeblock(diff_text, "diff")
+                results_md.append(block)
                 i += 1
                 continue
 
@@ -643,96 +690,95 @@ class ToolExecutor:
                 changed_any = False
                 hunk_reports: List[str] = []
 
+                # Process hunks within this update section
                 while i < len(lines):
-                    line = lines[i]
-                    if _is_end(line):
+                    if _is_end(lines[i]):
                         break
-                    mop, _a = _match_header(line)
-                    if mop in {"add","delete","update","overwrite","move_to"}:
-                        break
-                    if not line.startswith("@@"):
-                        if line.strip() == "":
-                            i += 1
-                            continue
-                        msg = f"## Error\nExpected a hunk starting with '@@' in Update for '{rel}', got: {line}"
-                        return {"model": msg, "display": _display_truncate(msg)}
-                    i += 1  # consume hunk header
+                    mo, _a = _match_header(lines[i])
+                    if mo:
+                        break  # next file section
 
-                    before_seq: List[str] = []
-                    after_seq:  List[str] = []
+                    # Collect one contiguous hunk (context + +/- lines) until blank line or next header/end
+                    hunk_lines: List[str] = []
                     while i < len(lines):
-                        hl = lines[i]
-                        if _is_end(hl):
+                        s = lines[i]
+                        if _is_end(s):
                             break
-                        mop2, _a2 = _match_header(hl)
-                        if mop2 in {"add","delete","update","overwrite","move_to"} or hl.startswith("@@"):
+                        mo2, _a2 = _match_header(s)
+                        if mo2:
                             break
-
-                        if hl == "":
-                            before_seq.append("")
-                            after_seq.append("")
+                        if s.strip() == "":
+                            # blank lines separate hunks; keep one and advance
                             i += 1
-                            continue
-
-                        prefix = hl[0]
-                        content = hl[1:] if len(hl) > 0 else ""
-                        if prefix == " ":
-                            before_seq.append(content)
-                            after_seq.append(content)
-                        elif prefix == "-":
-                            before_seq.append(content)
-                        elif prefix == "+":
-                            after_seq.append(content)
-                        else:
-                            msg = f"## Error\nInvalid hunk line prefix '{prefix}' in Update for '{rel}'."
-                            return {"model": msg, "display": _display_truncate(msg)}
+                            break
+                        hunk_lines.append(s)
                         i += 1
 
-                    start_idx = find_subseq(file_lines, before_seq)
-                    if start_idx == -1:
-                        relaxed_hay = [s.rstrip() for s in file_lines]
-                        relaxed_need = [s.rstrip() for s in before_seq]
-                        start_idx = find_subseq(relaxed_hay, relaxed_need)
+                    # Partition into context/added/removed
+                    ctx = [l[1:] for l in hunk_lines if l.startswith(" ")]
+                    add = [l[1:] for l in hunk_lines if l.startswith("+")]
+                    rem = [l[1:] for l in hunk_lines if l.startswith("-")]
 
-                    if start_idx == -1:
-                        hunk_reports.append(f"- ⚠️  Hunk not applied (context not found); size before/after: {len(before_seq)}/{len(after_seq)}")
+                    # If there's no explicit context, try a simple replace: remove `rem` then insert `add` at first match
+                    pos = find_subseq(file_lines, ctx if ctx else rem)
+                    if pos == -1 and ctx:
+                        any_errors.append(f"Could not find context in {rel} for a hunk; skipped.")
                         continue
 
-                    end_idx = start_idx + len(before_seq)
-                    file_lines = file_lines[:start_idx] + after_seq + file_lines[end_idx:]
-                    changed_any = True
-                    hunk_reports.append(f"- ✅ Hunk applied at lines {start_idx}:{end_idx} (−{len(before_seq)} → +{len(after_seq)})")
+                    if ctx:
+                        pos = find_subseq(file_lines, ctx)
+                        if pos != -1:
+                            # Replace exact context block with (rem applied + add)
+                            # Build the hunk application window
+                            before = file_lines[:pos]
+                            window = file_lines[pos:pos+len(ctx)]
+                            after = file_lines[pos+len(ctx):]
 
-                if not changed_any:
-                    any_errors.append(f"Update produced no applied hunks for {rel}.")
-                    continue
+                            # Apply removals inside the window if provided; otherwise treat ctx as the target block.
+                            if rem:
+                                # Remove any exact sub-sequences in order
+                                # (Simplified approach: remove lines present in `rem` from `window` by first occurrence)
+                                win = window[:]
+                                for rl in rem:
+                                    try:
+                                        win.remove(rl)
+                                    except ValueError:
+                                        pass
+                                window = win
 
-                new_text = "\n".join(file_lines)
-                if new_text and not new_text.endswith("\n"):
-                    new_text += "\n"
-                abs_path.write_text(new_text, encoding="utf-8")
+                            # Insert adds where the context was
+                            new_window = window + add
+                            file_lines = before + new_window + after
+                            changed_any = True
+                        else:
+                            any_errors.append(f"Context not found in {rel}; hunk skipped.")
+                    else:
+                        # No context: raw remove-then-insert at first position of `rem` or at file end
+                        if rem:
+                            pos = find_subseq(file_lines, rem)
+                            if pos != -1:
+                                file_lines = file_lines[:pos] + file_lines[pos+len(rem):]
+                                changed_any = True
+                        # Insert adds at the end
+                        if add:
+                            file_lines.extend(add)
+                            changed_any = True
 
-                final_read_path = abs_path
+                final_text = "\n".join(file_lines) + ("\n" if file_lines and not file_lines[-1].endswith("\n") else "")
+                abs_path.write_text(final_text, encoding="utf-8")
+
+                # Optionally move the file
                 if move_to:
                     new_abs = Path.cwd() / move_to
                     new_abs.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(abs_path), str(new_abs))
-                    final_read_path = new_abs
+                    rel = move_to
+                    abs_path = new_abs
 
-                final_text = final_read_path.read_text(encoding="utf-8")
-                final_lines = final_text.splitlines()
-                diff_text, added, removed = _diff_and_stats(
-                    old_lines, final_lines, from_name=str(rel), to_name=str(move_to if move_to else rel)
-                )
+                diff_text, added, removed = _diff_and_stats(old_lines, file_lines, from_name=str(rel), to_name=str(rel))
                 net = added - removed
                 summary_ops.append(f"Updated {rel}{moved_to_text} (+{added}/-{removed}, net {net:+d})")
-
-                block = (
-                    f"### Updated: `{rel}`{moved_to_text}\n"
-                    + "\n".join(hunk_reports) + "\n"
-                    f"- Lines added: **{added}**, removed: **{removed}**, net: **{net:+d}**\n"
-                    + _md_codeblock(diff_text if diff_text.strip() else "(no visible diff; whitespace-only change or metadata)", "diff")
-                )
+                block = f"### Updated: `{rel}`{moved_to_text}\n- Lines added: **{added}**, removed: **{removed}**, net: **{net:+d}**\n" + _md_codeblock(diff_text if diff_text.strip() else "(no visible diff)", "diff")
                 results_md.append(block)
                 continue
 
@@ -751,8 +797,8 @@ class ToolExecutor:
         summary_list = "\n".join(f"- {op}" for op in summary_ops) if summary_ops else "_(no changes)_"
         warnings_list = ("\n".join(f"- {w}" for w in any_errors)) if any_errors else ""
         warnings_block = f"\n### Warnings\n{warnings_list}\n" if warnings_list else ""
+
         omitted_sections = 0
-        detail_blocks: List[str]
         if results_md:
             if len(results_md) > MAX_PATCH_SECTIONS:
                 omitted_sections = len(results_md) - MAX_PATCH_SECTIONS
@@ -773,7 +819,6 @@ class ToolExecutor:
                 warnings_block = f"\n### Warnings\n{extra_warning}\n"
 
         detail = "\n\n".join(detail_blocks)
-
         full_md = f"{status_line}{summary_list}{warnings_block}\n\n---\n{detail}"
 
         # Auto-truncate for the model if the patch report is enormous

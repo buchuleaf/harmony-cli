@@ -11,6 +11,7 @@ from datetime import datetime
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
+from typing import Optional
 
 try:
     from .harmony import create_system_message, create_developer_message
@@ -49,7 +50,6 @@ def _detect_program_root() -> Path:
     except OSError:
         return Path(__file__).resolve().parent
 
-
 def _run_python_tool_from_file(path: Path) -> int:
     try:
         code = path.read_text(encoding="utf-8")
@@ -57,31 +57,47 @@ def _run_python_tool_from_file(path: Path) -> int:
         print(f"Failed to read python tool input: {exc}", file=sys.stderr)
         return 1
 
+    # Capture stdout/stderr for the exec'd code
+    import io
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+
     namespace = {"__name__": "__main__"}
+    exit_code = 0
     try:
         exec(compile(code, str(path), "exec"), namespace, namespace)
     except SystemExit as exc:
         code = exc.code
-        return int(code) if isinstance(code, int) else 1
-    except Exception:  # pragma: no cover - bubbled to stderr for debugging
+        exit_code = int(code) if isinstance(code, int) else 1
+    except Exception:
         traceback.print_exc()
-        return 1
-    return 0
+        exit_code = 1
+    finally:
+        # Write captured output to actual stdout/stderr
+        captured_out = sys.stdout.getvalue()
+        captured_err = sys.stderr.getvalue()
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        if captured_out:
+            sys.stdout.write(captured_out)
+        if captured_err:
+            sys.stderr.write(captured_err)
+    
+    return exit_code
 
-
-def _maybe_run_python_tool_via_argv(argv: list[str]) -> bool:
+def _maybe_run_python_tool_via_argv(argv: list[str]) -> Optional[int]:
+    """Checks for the --python-tool flag. If present, runs the tool and returns an exit code. Otherwise, returns None."""
     if len(argv) >= 2 and argv[1] == "--python-tool":
         if len(argv) < 3:
             print("--python-tool requires a path argument", file=sys.stderr)
-            exit_code = 2
+            return 2
         else:
             path = Path(argv[2])
-            exit_code = _run_python_tool_from_file(path)
-        raise SystemExit(exit_code)
-    return False
+            return _run_python_tool_from_file(path)
+    return None
 
-
-_maybe_run_python_tool_via_argv(sys.argv)
 
 APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
