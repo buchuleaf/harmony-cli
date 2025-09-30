@@ -157,29 +157,32 @@ def _truncate_output(
 
     return "\n".join(processed_lines) + truncation_message
 
-def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
-    """Trim markdown for console display and append a simple hidden-line note."""
-    lines = md.splitlines()
-    if len(lines) <= max_lines:
-        # Nothing to trim; still report using content-aware counts if needed.
-        return md
+def _display_truncate(
+    md: str, model_md: str, max_lines: int = DISPLAY_MAX_LINES
+) -> str:
+    """Trims markdown for console display and adds a note about lines available to the model."""
+    display_lines = md.splitlines()
+    model_lines_count = len(model_md.splitlines())
 
-    # Trim by raw lines (to respect display budget)
-    trimmed_lines = lines[:max_lines]
-    shown_raw_count = len(trimmed_lines)
+    trimmed_lines = display_lines
+    if len(display_lines) > max_lines:
+        trimmed_lines = display_lines[:max_lines]
+        # Count the number of fence markers in the trimmed region. If odd, we're inside a fence.
+        fence_count = sum(1 for L in trimmed_lines if L.strip().startswith("```"))
+        if fence_count % 2 == 1:
+            # We were cut mid-fence; close it to avoid broken formatting.
+            trimmed_lines.append("```")
 
-    # Count the number of fence markers in the trimmed region. If odd, we're inside a fence.
-    fence_count = sum(1 for L in trimmed_lines if L.strip().startswith("```"))
-    if fence_count % 2 == 1:
-        # We were cut mid-fence; close it to avoid broken formatting.
-        trimmed_lines.append("```")
+    final_display_md = "\n".join(trimmed_lines)
+    shown_lines_count = len(trimmed_lines)
 
-    trimmed = "\n".join(trimmed_lines)
+    hidden_count = max(0, model_lines_count - shown_lines_count)
 
-    hidden_raw = max(len(lines) - shown_raw_count, 0)
+    if hidden_count > 0:
+        suffix = f"\n\n... {hidden_count} more lines are available to the model ...\n"
+        return final_display_md + suffix
 
-    suffix = f"\n\n... {hidden_raw} lines hidden ...\n"
-    return trimmed + suffix
+    return final_display_md
 
 def _compose_cache_payload(stdout: str, stderr: str, returncode: int) -> str:
     parts = [f"[exit_code] {returncode}"]
@@ -250,15 +253,15 @@ class ToolExecutor:
         if method is None:
             # Note: I've slightly improved the error message for clarity.
             msg = f"## Error\nTool `{tool_name}` not found."
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
         try:
             return method(**kwargs)
         except TypeError as te:
             msg = f"## Error\nInvalid arguments for `{tool_name}`: {te}"
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
         except Exception as e:
             msg = f"## Error\n{type(e).__name__}: {e}"
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
     # --- run ---
 
@@ -314,7 +317,7 @@ class ToolExecutor:
         kind = (kind or "").lower()
         if kind not in ("python", "shell"):
             msg = "## Error\n`kind` must be 'python' or 'shell'."
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
         command_traits: Dict[str, bool] = {}
         if kind == "shell" and isinstance(code, str):
@@ -334,10 +337,10 @@ class ToolExecutor:
                 )
         except subprocess.TimeoutExpired as te:
             msg = "## Error\nExecution timed out after {}s.\n".format(timeout) + _md_codeblock(str(te), "text")
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
         except Exception as e:
             msg = "## Error\nExecution failed:\n" + _md_codeblock(str(e), "text")
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
@@ -419,7 +422,7 @@ class ToolExecutor:
         for note in notes:
             display_sections.append(f"_{note}_\n")
 
-        display_content = _display_truncate("".join(display_sections), DISPLAY_MAX_LINES)
+        display_content = _display_truncate("".join(display_sections), model_content, DISPLAY_MAX_LINES)
         return {"model": model_content, "display": display_content}
 
     def python(self, code: str, timeout: int = 30) -> Dict[str, str]:
@@ -427,10 +430,10 @@ class ToolExecutor:
             result = self._run_python_process(code, timeout)
         except subprocess.TimeoutExpired as te:
             msg = "## Error\nExecution timed out after {}s.\n".format(timeout) + _md_codeblock(str(te), "text")
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
         except Exception as e:
             msg = "## Error\nExecution failed:\n" + _md_codeblock(str(e), "text")
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
@@ -496,7 +499,7 @@ class ToolExecutor:
         if not stdout and not stderr:
             display_sections.append("The command produced no output.\n")
 
-        display_content = _display_truncate("".join(display_sections), DISPLAY_MAX_LINES)
+        display_content = _display_truncate("".join(display_sections), model_content, DISPLAY_MAX_LINES)
         return {"model": model_content, "display": display_content}
 
     # --- apply_patch (forgiving; partial hunks; overwrite support) ---
@@ -504,7 +507,7 @@ class ToolExecutor:
     def apply_patch(self, patch: str) -> Dict[str, str]:
         if not isinstance(patch, str) or not patch.strip():
             msg = "## Error\n`patch` must be a non-empty string."
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
         # Strip code fences if present
         text = patch.strip()
@@ -540,7 +543,7 @@ class ToolExecutor:
 
         if i >= len(lines) or not _is_begin(lines[i]):
             msg = "## Error\nPatch must start with '*** Begin Patch'."
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
         i += 1
 
         results_md: List[str] = []
@@ -562,7 +565,7 @@ class ToolExecutor:
             op, arg = _match_header(raw)
             if not op:
                 msg = f"## Error\nUnrecognized patch directive: {raw}"
-                return {"model": msg, "display": _display_truncate(msg)}
+                return {"model": msg, "display": _display_truncate(msg, msg)}
 
             # ADD
             if op == "add":
@@ -571,7 +574,7 @@ class ToolExecutor:
                     rel = _safe_rel_path(raw_path)
                 except Exception as e:
                     msg = f"## Error\nInvalid Add path '{raw_path}': {e}"
-                    return {"model": msg, "display": _display_truncate(msg)}
+                    return {"model": msg, "display": _display_truncate(msg, msg)}
                 i += 1
                 content_lines: List[str] = []
                 while i < len(lines):
@@ -581,7 +584,7 @@ class ToolExecutor:
                         break
                     if not l.startswith("+"):
                         msg = f"## Error\nAdd File '{raw_path}' expects lines starting with '+'. Offending line: {l}"
-                        return {"model": msg, "display": _display_truncate(msg)}
+                        return {"model": msg, "display": _display_truncate(msg, msg)}
                     content_lines.append(l[1:])
                     i += 1
 
@@ -606,11 +609,11 @@ class ToolExecutor:
                     rel = _safe_rel_path(raw_path)
                 except Exception as e:
                     msg = f"## Error\nInvalid Delete path '{raw_path}': {e}"
-                    return {"model": msg, "display": _display_truncate(msg)}
+                    return {"model": msg, "display": _display_truncate(msg, msg)}
                 abs_path = Path.cwd() / rel
                 if not abs_path.exists() or abs_path.is_dir():
                     msg = f"## Error\nDelete target does not exist or is a directory: {rel}"
-                    return {"model": msg, "display": _display_truncate(msg)}
+                    return {"model": msg, "display": _display_truncate(msg, msg)}
                 old_text = abs_path.read_text(encoding="utf-8")
                 old_lines = old_text.splitlines()
                 abs_path.unlink()
@@ -629,7 +632,7 @@ class ToolExecutor:
                     rel = _safe_rel_path(raw_path)
                 except Exception as e:
                     msg = f"## Error\nInvalid Overwrite path '{raw_path}': {e}"
-                    return {"model": msg, "display": _display_truncate(msg)}
+                    return {"model": msg, "display": _display_truncate(msg, msg)}
                 i += 1
                 new_content: List[str] = []
                 while i < len(lines):
@@ -639,7 +642,7 @@ class ToolExecutor:
                         break
                     if not l.startswith("+"):
                         msg = f"## Error\nOverwrite File '{raw_path}' expects lines starting with '+'. Offending line: {l}"
-                        return {"model": msg, "display": _display_truncate(msg)}
+                        return {"model": msg, "display": _display_truncate(msg, msg)}
                     new_content.append(l[1:])
                     i += 1
 
@@ -662,12 +665,12 @@ class ToolExecutor:
                     rel = _safe_rel_path(raw_path)
                 except Exception as e:
                     msg = f"## Error\nInvalid Update path '{raw_path}': {e}"
-                    return {"model": msg, "display": _display_truncate(msg)}
+                    return {"model": msg, "display": _display_truncate(msg, msg)}
 
                 abs_path = Path.cwd() / rel
                 if not abs_path.exists() or abs_path.is_dir():
                     msg = f"## Error\nUpdate target does not exist or is a directory: {rel}"
-                    return {"model": msg, "display": _display_truncate(msg)}
+                    return {"model": msg, "display": _display_truncate(msg, msg)}
 
                 i += 1
                 move_to: Optional[Path] = None
@@ -681,7 +684,7 @@ class ToolExecutor:
                             moved_to_text = f" -> moved to `{move_to}`"
                         except Exception as e:
                             msg = f"## Error\nInvalid Move to path '{newp}': {e}"
-                            return {"model": msg, "display": _display_truncate(msg)}
+                            return {"model": msg, "display": _display_truncate(msg, msg)}
                         i += 1
 
                 old_text = abs_path.read_text(encoding="utf-8")
@@ -793,11 +796,11 @@ class ToolExecutor:
 
             # Should never reach here
             msg = f"## Error\nUnrecognized patch directive: {raw}"
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
         if i >= len(lines) or not _is_end(lines[i]):
             msg = "## Error\nPatch must end with '*** End Patch'."
-            return {"model": msg, "display": _display_truncate(msg)}
+            return {"model": msg, "display": _display_truncate(msg, msg)}
 
         status_line = "## ✅ Patch Applied\n" if summary_ops else "## ⚠️ Patch Processed (no changes)\n"
         if any_errors:
@@ -840,5 +843,5 @@ class ToolExecutor:
         else:
             model_content = full_md
 
-        display_content = _display_truncate(full_md, DISPLAY_MAX_LINES)
+        display_content = _display_truncate(full_md, model_content, DISPLAY_MAX_LINES)
         return {"model": model_content, "display": display_content}
