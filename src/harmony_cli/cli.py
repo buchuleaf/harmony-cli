@@ -364,7 +364,9 @@ def main():
                 break  # return to prompt
 
             # Execute tools and feed results
-            console.rule("\n[bold blue]Tool Results[/bold blue]", style="blue")
+            section_title = "Tool Results"
+            console.print(f"\n{section_title}", markup=False)
+            console.print("-" * len(section_title), markup=False)
             tool_results = []
             for tc in tool_calls_in_progress:
                 fname = tc["function"]["name"]
@@ -374,7 +376,7 @@ def main():
                     args = json.loads(args_str)
                 except json.JSONDecodeError as e:
                     err = f"Error decoding arguments for {fname}: {e}\nArguments received: {args_str}"
-                    console.print(Panel(err, title="[bold red]Argument Error[/bold red]", border_style="red"))
+                    console.print(f"Argument Error: {err}", markup=False)
                     tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": err})
                     continue
 
@@ -387,18 +389,19 @@ def main():
                     model_content = result.get("model", "")
                     display_content = result.get("display", model_content)
 
-                    header = Text.assemble(
-                        (f"Tool Result: {fname}", "bold green"),
-                        ("  ⏱ ", "dim"),
-                        (f"{t_tool:.2f}s", "dim"),
-                    )
-                    console.print(Panel(Markdown(display_content), title=header, border_style="green", expand=False))
+                    header = f"Tool Result: {fname} ({t_tool:.2f}s)"
+                    console.print(header, markup=False)
+                    if display_content:
+                        console.print(display_content, markup=False)
+                    else:
+                        console.print("(no output)", markup=False)
+                    console.print()
 
                     # Push the model content into conversation for the LLM
                     tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": model_content})
                 except Exception as e:
                     err = f"Error executing tool {fname}: {e}"
-                    console.print(Panel(err, title="[bold red]Execution Error[/bold red]", border_style="red"))
+                    console.print(f"Execution Error: {err}", markup=False)
                     tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": err})
 
             conversation_history.extend(tool_results)

@@ -166,6 +166,7 @@ def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
 
     # Trim by raw lines (to respect display budget)
     trimmed_lines = lines[:max_lines]
+    shown_raw_count = len(trimmed_lines)
 
     # Count the number of fence markers in the trimmed region. If odd, we're inside a fence.
     fence_count = sum(1 for L in trimmed_lines if L.strip().startswith("```"))
@@ -194,10 +195,16 @@ def _display_truncate(md: str, max_lines: int = DISPLAY_MAX_LINES) -> str:
     hidden_visible = max(total_visible - shown_visible, 0)
 
     trimmed = "\n".join(trimmed_lines)
-    hidden_note = "content line" if hidden_visible == 1 else "content lines"
-    return trimmed + (
-        f"\n\n... (display truncated: {hidden_visible} {hidden_note} hidden) ...\n"
-    )
+
+    hidden_raw = max(len(lines) - shown_raw_count, 0)
+    hidden_raw_note = "line" if hidden_raw == 1 else "lines"
+    hidden_visible_note = "content line" if hidden_visible == 1 else "content lines"
+
+    suffix = f"\n\n... (display truncated: {hidden_raw} {hidden_raw_note} hidden"
+    if hidden_visible != hidden_raw:
+        suffix += f"; {hidden_visible} {hidden_visible_note}"
+    suffix += ") ...\n"
+    return trimmed + suffix
 
 
 def _compose_cache_payload(stdout: str, stderr: str, returncode: int) -> str:
