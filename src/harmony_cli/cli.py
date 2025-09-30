@@ -230,6 +230,11 @@ def prompt_user(console: Console) -> str:
 # ---------- Main CLI ----------
 
 def main():
+    # Check for --python-tool FIRST before any other setup
+    exit_code = _maybe_run_python_tool_via_argv(sys.argv)
+    if exit_code is not None:
+        sys.exit(exit_code)
+    
     console = Console()
 
     launch_root = _detect_program_root()
