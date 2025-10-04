@@ -344,11 +344,11 @@ def main():
 
             full_response_content = ""
             tool_calls_in_progress = []
-            tool_print_state = {}
             was_interrupted = False
 
-            console.print("\nAssistant:", markup=False)
-
+            console.print("\n[bold cyan]Assistant (streaming):[/bold cyan]")
+            
+            # --- STAGE 1: Stream raw text for a smooth, non-disruptive scroll experience ---
             try:
                 for chunk in stream_model_response(conversation_history, tools_definition):
                     if not chunk.get("choices"):
@@ -357,49 +357,40 @@ def main():
 
                     if (txt := delta.get("content")):
                         full_response_content += txt
-                        console.print(txt, end="", markup=False, highlight=False, soft_wrap=False)
+                        console.print(txt, end="", markup=False, highlight=False, soft_wrap=True)
 
                     if "tool_calls" in delta and delta["tool_calls"]:
                         for tc in delta["tool_calls"]:
                             idx = tc["index"]
                             while len(tool_calls_in_progress) <= idx:
                                 tool_calls_in_progress.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                            state = tool_print_state.setdefault(idx, {"started": False, "closed": False})
                             call_entry = tool_calls_in_progress[idx]
 
-                            if "id" in tc:
-                                call_entry["id"] = tc["id"]
-
+                            if "id" in tc: call_entry["id"] = tc["id"]
                             if "function" in tc:
                                 func_payload = tc["function"]
                                 call_fn = call_entry["function"]
-
-                                if "name" in func_payload and func_payload["name"]:
-                                    call_fn["name"] = func_payload["name"]
-
-                                args_part = func_payload.get("arguments", "")
-
-                                if not state["started"] and (call_fn["name"] or args_part):
-                                    display_name = call_fn["name"] or "unknown"
-                                    console.print(f"\nCalling Tool: {display_name}(", end="", markup=False)
-                                    state["started"] = True
-
-                                if args_part:
-                                    call_fn["arguments"] += args_part
-                                    console.print(args_part, end="", markup=False, highlight=False, soft_wrap=False)
-                    console.file.flush()
+                                if "name" in func_payload: call_fn["name"] = func_payload["name"]
+                                if "arguments" in func_payload: call_fn["arguments"] += func_payload.get("arguments", "")
             except KeyboardInterrupt:
                 was_interrupted = True
+            
+            console.print() # Final newline after stream
 
-            for idx, state in tool_print_state.items():
-                if state["started"] and not state["closed"]:
-                    console.print(")", markup=False)
-                    state["closed"] = True
+            # --- STAGE 2: Render the final, complete text as Markdown ---
+            if full_response_content.strip() and not was_interrupted:
+                console.print("\n[bold cyan]Assistant (formatted):[/bold cyan]")
+                console.print(Markdown(full_response_content.strip()))
 
             if was_interrupted:
-                console.print("— interrupted —", markup=False)
+                console.print("\n— interrupted —", markup=False)
 
-            console.print()
+            # Log tool calls after the streaming is complete
+            for call in tool_calls_in_progress:
+                func = call.get("function", {})
+                name = func.get("name", "unknown_tool")
+                args = func.get("arguments", "")
+                console.print(f"\n[dim]Calling Tool: [bold]{name}[/bold]({args})[/dim]")
 
             # Timing + tokens
             dt = time.perf_counter() - t0
@@ -408,7 +399,7 @@ def main():
                 f"⏱ {dt:.2f}s  |  in ≈ {prompt_tok_est} tok  |  out ≈ {completion_tok_est} tok  |  "
                 f"{'(interrupted)' if was_interrupted else '(complete)'}"
             )
-            console.print(status, markup=False)
+            console.print(f"[dim]{status}[/dim]")
 
             # History
             assistant_msg = {"role": "assistant", "content": (full_response_content or "").rstrip()}
@@ -424,8 +415,8 @@ def main():
 
             # Execute tools and feed results
             section_title = "Tool Results"
-            console.print(f"\n{section_title}", markup=False)
-            console.print("-" * len(section_title), markup=False)
+            console.print(f"\n[bold]{section_title}[/bold]")
+            console.print("-" * len(section_title))
             tool_results = []
             for tc in tool_calls_in_progress:
                 fname = tc["function"]["name"]
@@ -444,16 +435,12 @@ def main():
                     result = tool_executor.execute_tool(fname, **args)
                     t_tool = time.perf_counter() - t_tool0
 
-                    # result is a dict: {"model": "...", "display": "..."}
                     model_content = result.get("model", "")
                     display_content = result.get("display", model_content)
 
                     header = f"Tool Result: {fname} ({t_tool:.2f}s)"
-                    console.print(header, markup=False)
-                    _render_markdown(console, display_content)
-                    console.print()
+                    console.print(Panel(display_content, title=f"[bold]{header}[/bold]", border_style="green"))
 
-                    # Push the model content into conversation for the LLM
                     tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": model_content})
                 except Exception as e:
                     err = f"Error executing tool {fname}: {e}"
@@ -461,7 +448,6 @@ def main():
                     tool_results.append({"tool_call_id": tcall_id, "role": "tool", "name": fname, "content": err})
 
             conversation_history.extend(tool_results)
-            # Loop so the model can react to tool outputs
 
     console.print("\n[bold red]Exiting.[/bold red]")
 
